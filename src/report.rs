@@ -106,7 +106,7 @@ pub struct WorkerReport {
     pub affinity: Vec<usize>,
     pub statistics: WorkerStatistics,
     pub connections: Vec<ConnectionCounters>,
-    /// The time its CPU spent in software interrupts over the controller's window, when it was pinned and `/proc/stat` could be read. Its thread's CPU time leaves this out, though on loopback much of it is the kernel delivering the worker's own packets.
+    /// The time its CPU spent in software interrupts over the controller's window, when it was pinned and `/proc/stat` could be read. Its thread's CPU time leaves this out on kernels that account interrupt time separately, though on loopback much of it is the kernel delivering the worker's own packets.
     pub softirq: Option<u64>,
 }
 
