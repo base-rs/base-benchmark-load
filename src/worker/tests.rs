@@ -186,6 +186,58 @@ fn an_open_loop_worker_runs_its_schedule_on_its_clock() {
     assert!(statistics.busy > 0);
 }
 
+/// A poller whose every wait takes `pause` of its clock's time, as a long iteration handling many events would.
+struct Pausing<'a> {
+    epoll: Epoll,
+    clock: &'a StepClock,
+    pause: u64,
+}
+
+impl Poller for Pausing<'_> {
+    fn add(&mut self, descriptor: RawFd, token: u64) -> io::Result<()> {
+        self.epoll.add(descriptor, token)
+    }
+
+    fn delete(&mut self, descriptor: RawFd) -> io::Result<()> {
+        self.epoll.delete(descriptor)
+    }
+
+    fn wait(&mut self, events: &mut [Event], timeout: i32) -> io::Result<usize> {
+        let count = self.epoll.wait(events, timeout)?;
+        self.clock.advance(self.pause);
+        Ok(count)
+    }
+}
+
+/// A worker reaches a due request only after the poll and the events of the iteration that found it due, so its schedule lag includes them: every request of the window, which fall due 1 ms apart while each poll takes 5 ms, is reached at least 5 ms late, however early in the iteration it fell due.
+#[test]
+fn schedule_lag_runs_until_the_worker_reaches_the_request() {
+    let fixture = Fixture::new();
+    let listener = listener();
+    let mut load = fixture.load(listener.local_addr().unwrap(), 1);
+    // The run ends with the window, abandoning what the server never answered.
+    load.drain_timeout = 0;
+    let pause = 5 * MS;
+    let clock = StepClock::new(0, 10_000);
+    let start = Start::new(1);
+    let result = std::thread::scope(|scope| {
+        let poller = Epoll::new().map(|epoll| Pausing {
+            epoll,
+            clock: &clock,
+            pause,
+        });
+        let worker = scope.spawn(|| work(&load, 0, poller, &clock, &start));
+        assert!(start.wait_for_workers().is_none());
+        start.publish(clock.now() + MS);
+        worker.join().unwrap().unwrap()
+    });
+    let statistics = &result.statistics;
+    let lag = &statistics.distributions.schedule_lag;
+    assert_eq!(lag.count(), 10);
+    assert!(lag.min().unwrap() >= pause, "{:?}", lag.min());
+    assert_eq!(statistics.finished(), 10);
+}
+
 #[test]
 fn workers_that_fail_to_set_up_return_nothing() {
     let fixture = Fixture::new();

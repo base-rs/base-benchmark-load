@@ -48,6 +48,11 @@ impl StepClock {
     pub fn set(&self, now: u64) {
         self.now.store(now, std::sync::atomic::Ordering::Relaxed);
     }
+
+    /// Move the clock `by` ahead, as if that long passed between two reads.
+    pub fn advance(&self, by: u64) {
+        self.now.fetch_add(by, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -78,5 +83,7 @@ mod tests {
         assert_eq!(clock.now(), 15);
         clock.set(100);
         assert_eq!(clock.now(), 100);
+        clock.advance(1000);
+        assert_eq!(clock.now(), 1105);
     }
 }

@@ -5,6 +5,7 @@
 
 use super::{extension, load, record, server::Server};
 use serde_json::json;
+use std::time::{Duration, Instant};
 
 /// The CPUs the calling thread may run on.
 fn affinity() -> Vec<usize> {
@@ -21,8 +22,19 @@ fn affinity() -> Vec<usize> {
     }
 }
 
-/// Run a short open loop with `extra` on a thread of its own, since the run pins the calling thread as its controller. Returns the CPUs that thread could use before and after, and the workers' affinities.
-fn placed(extra: &[String]) -> (Vec<usize>, Vec<usize>, Vec<serde_json::Value>) {
+/// What a run on a thread of its own found of its placement.
+struct Placed {
+    /// The CPUs the thread could use before and after the run.
+    before: Vec<usize>,
+    after: Vec<usize>,
+    /// The record's workers.
+    workers: Vec<serde_json::Value>,
+    /// How long the run took, measured around it.
+    elapsed: Duration,
+}
+
+/// Run a short open loop with `extra` on a thread of its own, since the run pins the calling thread as its controller.
+fn placed(extra: &[String]) -> Placed {
     let server = Server::hello();
     let extra = extra.to_vec();
     std::thread::spawn(move || {
@@ -38,9 +50,17 @@ fn placed(extra: &[String]) -> (Vec<usize>, Vec<usize>, Vec<serde_json::Value>) 
             "10ms",
         ];
         arguments.extend(extra.iter().map(String::as_str));
-        let record = record(&load("rate", server.address, &arguments).unwrap());
+        let started = Instant::now();
+        let report = load("rate", server.address, &arguments).unwrap();
+        let elapsed = started.elapsed();
+        let record = record(&report);
         let workers = extension(&record)["workers"].as_array().unwrap().clone();
-        (before, affinity(), workers)
+        Placed {
+            before,
+            after: affinity(),
+            workers,
+            elapsed,
+        }
     })
     .join()
     .unwrap()
@@ -50,17 +70,19 @@ fn placed(extra: &[String]) -> (Vec<usize>, Vec<usize>, Vec<serde_json::Value>) 
 #[test]
 fn a_pinned_controller_leaves_unpinned_workers_where_they_were() {
     let controller = affinity()[0];
-    let (before, after, workers) = placed(&[
+    let placed = placed(&[
         "--workers".to_owned(),
         "2".to_owned(),
         "--controller-cpu".to_owned(),
         controller.to_string(),
     ]);
-    assert_eq!(after, [controller]);
-    assert_eq!(workers.len(), 2);
-    for worker in workers {
+    assert_eq!(placed.after, [controller]);
+    assert_eq!(placed.workers.len(), 2);
+    for worker in placed.workers {
         assert_eq!(worker["cpu"], serde_json::Value::Null);
-        assert_eq!(worker["affinity"], json!(before));
+        assert_eq!(worker["affinity"], json!(placed.before));
+        // An unpinned worker has no CPU of its own whose software interrupt time it could report.
+        assert_eq!(worker["softirq_ns"], serde_json::Value::Null);
     }
 }
 
@@ -74,9 +96,24 @@ fn pinned_workers_run_only_on_their_cpus() {
     if let Some(cpu) = controller {
         extra.extend(["--controller-cpu".to_owned(), cpu.to_string()]);
     }
-    let (before, after, workers) = placed(&extra);
-    assert_eq!(after, controller.map_or(before, |cpu| vec![cpu]));
-    assert_eq!(workers.len(), 1);
-    assert_eq!(workers[0]["cpu"], worker);
-    assert_eq!(workers[0]["affinity"], json!([worker]));
+    let placed = placed(&extra);
+    assert_eq!(
+        placed.after,
+        controller.map_or(placed.before, |cpu| vec![cpu])
+    );
+    assert_eq!(placed.workers.len(), 1);
+    assert_eq!(placed.workers[0]["cpu"], worker);
+    assert_eq!(placed.workers[0]["affinity"], json!([worker]));
+    // A pinned worker reports its CPU's software interrupt time over the controller's window, which lies within the run: no more than the run took, and one tick of `/proc/stat`, since both ends of the window are read in whole ticks. Its CPU's time since boot would exceed it.
+    // SAFETY: `sysconf` has no preconditions.
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let tick = Duration::from_secs(1) / u32::try_from(ticks_per_second).unwrap();
+    let softirq = placed.workers[0]["softirq_ns"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{}", placed.workers[0]));
+    assert!(
+        u128::from(softirq) <= (placed.elapsed + tick).as_nanos(),
+        "{softirq} ns in software interrupts over a run of {:?}",
+        placed.elapsed
+    );
 }

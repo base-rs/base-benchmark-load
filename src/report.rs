@@ -170,7 +170,32 @@ impl Report {
         }
     }
 
-    /// Why the load may not be what the run claims: busy-polling uses every worker CPU whatever the load, so saturation is judged by busy time, by how late the workers reached due requests, and by whether the window's requests were sent in it.
+    /// The client's part of the [`Report::shortfall`]: how many fewer requests the workers reached on their schedule in the window than were planned in it, which is how much further behind their schedule they were at its end than at its start.
+    pub fn schedule_shortfall(&self) -> u64 {
+        match self.mode {
+            Mode::Rate => self.planned.saturating_sub(self.total.reached_in_window),
+            Mode::Closed => 0,
+        }
+    }
+
+    /// The connections' part of the [`Report::shortfall`], which the server held back unless the client is saturated: how many more requests the workers reached in the window than they sent in it, because their connections had no room, with as many requests outstanding as the depth allows, awaiting responses, or were reconnecting. Every request is reached before it is sent, and the shortfall is the sum of the two parts before each is clamped at zero.
+    pub fn connection_shortfall(&self) -> u64 {
+        match self.mode {
+            Mode::Rate => self
+                .total
+                .reached_in_window
+                .saturating_sub(self.total.sent_in_window),
+            Mode::Closed => 0,
+        }
+    }
+
+    /// Whether `shortfall` is more than `--shortfall-limit` of the requests planned in the window, and its share of them.
+    fn excessive(&self, shortfall: u64) -> Option<f64> {
+        (shortfall as f64 > self.shortfall_limit * self.planned as f64)
+            .then(|| shortfall as f64 / self.planned as f64)
+    }
+
+    /// Why the load may not be what the run claims because of the client: busy-polling uses every worker CPU whatever the load, so saturation is judged by busy time, by how late the workers reached due requests, and by whether they reached the window's requests in it.
     pub fn saturation(&self) -> Vec<String> {
         let mut reasons = Vec::new();
         for (index, busy) in self.busy_fractions().into_iter().enumerate() {
@@ -195,15 +220,34 @@ impl Report {
                 ));
             }
         }
-        let shortfall = self.shortfall();
-        if shortfall as f64 > self.shortfall_limit * self.planned as f64 {
+        let shortfall = self.schedule_shortfall();
+        if let Some(share) = self.excessive(shortfall) {
             reasons.push(format!(
-                "{shortfall} of the {} requests planned in the window ({:.2}%) were not sent in it",
+                "the workers reached {shortfall} fewer requests in the window than the {} planned in it ({:.2}%)",
                 self.planned,
-                shortfall as f64 * 100.0 / self.planned as f64
+                share * 100.0
             ));
         }
         reasons
+    }
+
+    /// Why the window did not carry the offered rate other than because the workers fell behind their schedule, if it did not: the workers reached more than `--shortfall-limit` of the requests planned in the window in it, but could send them only after it, because their connections were awaiting responses or reconnecting. The server held them back, unless the client is saturated, when it may have read the responses that make room late. Either way, this is not the client's saturation, so `--fail-on saturated` ignores it.
+    pub fn held_back(&self) -> Option<String> {
+        let shortfall = self.connection_shortfall();
+        let share = self.excessive(shortfall)?;
+        let (side, responses) = if self.saturation().is_empty() {
+            ("the server", "responses")
+        } else {
+            (
+                "their connections",
+                "responses, which the saturated client may have read late,",
+            )
+        };
+        Some(format!(
+            "{side} held back {shortfall} requests ({:.2}% of the {} planned in the window): the workers reached them in the window, but sent them after it, since their connections were awaiting {responses} or reconnecting",
+            share * 100.0,
+            self.planned
+        ))
     }
 
     fn all_outcomes(&self) -> Outcomes {
@@ -258,7 +302,7 @@ impl Report {
 
     /// The `base-benchmark` process record, with one sample over the measured window.
     ///
-    /// Totals of the measured phase are divided by the operations in `base-benchmark` summaries, and only properties of the server have a direction: its timings, wall time per success, invalid responses, and errors are lower-is-better. Diagnostics of the client, such as its CPU time, context switches, dispatch and schedule lag, busy time, the shortfall, and saturation, are neutral, since a faster server makes the client busier.
+    /// Totals of the measured phase are divided by the operations in `base-benchmark` summaries, and only properties of the server have a direction: its timings, wall time per success, invalid responses, and errors are lower-is-better. Diagnostics of the run, such as the client's CPU time, context switches, dispatch and schedule lag, busy time, the shortfalls, and saturation, are neutral, since a faster server makes the client busier.
     ///
     /// Fails when there are no operations to normalize by: a run without a single valid response in the measured period.
     pub fn record(&self) -> io::Result<ProcessRecord> {
@@ -316,6 +360,8 @@ impl Report {
         sample.push(count("sent_in_window", self.total.sent_in_window));
         if self.mode == Mode::Rate {
             sample.push(count("sent_in_window_shortfall", self.shortfall()));
+            sample.push(count("schedule_shortfall", self.schedule_shortfall()));
+            sample.push(count("connection_shortfall", self.connection_shortfall()));
         }
         // Every valid response of the measured period is in every distribution, and the schedule lag holds every request planned in the window, which a valid response of the cohort was, so none is empty.
         const NONEMPTY: &str = "a record has valid responses, which every distribution holds";
@@ -515,8 +561,13 @@ impl Report {
                 "busy_limit": self.busy_limit,
                 "schedule_lag_limit_ns": (self.mode == Mode::Rate).then_some(self.schedule_lag_limit),
                 "shortfall_limit": (self.mode == Mode::Rate).then_some(self.shortfall_limit),
-                "shortfall": (self.mode == Mode::Rate).then_some(self.shortfall()),
             },
+            "shortfall": (self.mode == Mode::Rate).then(|| json!({
+                "sent": self.shortfall(),
+                "schedule": self.schedule_shortfall(),
+                "connection": self.connection_shortfall(),
+                "held_back": self.held_back(),
+            })),
             "workers": workers,
             "intervals": intervals,
             "histograms": histograms,
@@ -624,6 +675,9 @@ impl Report {
             format!("SATURATED: {}", saturation.join("; "))
         };
         let _ = writeln!(text, "workers busy: {}; {verdict}", busy.join(" "));
+        if let Some(reason) = self.held_back() {
+            let _ = writeln!(text, "shortfall: {reason}");
+        }
         text
     }
 
