@@ -135,7 +135,13 @@ impl Rendezvous {
 
     /// Meet with `parties` parties from now on. Call it only while fewer than `parties` are waiting, so that none is left waiting for parties that will not come.
     fn reduce(&self, parties: usize) {
-        self.lock().parties = parties;
+        let mut meeting = self.lock();
+        // The last party to arrive is the one that finds every party waiting, so with as many waiting already, none ever would.
+        debug_assert!(
+            meeting.waiting < parties,
+            "a rendezvous is reduced only to more parties than are waiting at it"
+        );
+        meeting.parties = parties;
     }
 }
 
@@ -160,6 +166,15 @@ impl Start {
     pub fn started_only(&self, started: usize, error: io::Error) {
         self.rendezvous.reduce(started + 1);
         *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = Some(error);
+    }
+
+    /// Whether a failure has been recorded and not yet returned by [`Start::wait_for_workers`].
+    #[cfg(test)]
+    pub fn failed(&self) -> bool {
+        self.failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
     }
 
     /// The arrival of worker `worker` at the start, which it reports with [`Arrival::ready`]. Every worker takes one before it sets up.

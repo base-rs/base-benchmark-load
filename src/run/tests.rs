@@ -207,51 +207,77 @@ fn a_worker_that_panics_while_setting_up_fails_the_run() {
             abandoned.lock().unwrap().push((worker, started));
             None
         },
-        |_, builder| Ok(builder),
+        |_, builder, _| Ok(builder),
     )
     .unwrap_err();
     assert_eq!(error.to_string(), "worker 1 panicked while setting up");
     assert_eq!(*abandoned.lock().unwrap(), [(0, None)]);
 }
 
-/// A worker thread that cannot be spawned, as when the process may have no more threads, fails the run with an error naming how many workers started, instead of leaving them waiting for the others at the start; they are abandoned and joined, and no other is spawned. The failure to spawn is reported even when a worker that started also failed to set up.
+/// Run `body` on a thread of its own and return when it does, failing if it has not within a minute, so that a test whose threads wait forever fails instead of hanging. The minute only bounds a hang: the body takes milliseconds.
+fn within_a_minute(body: impl FnOnce() + Send + 'static) {
+    let (finished, done) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        // Dropped when the body returns or panics.
+        let _finished = finished;
+        body();
+    });
+    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+        done.recv_timeout(Duration::from_secs(60))
+    {
+        panic!("the test did not finish within a minute");
+    }
+    if let Err(panic) = thread.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A worker thread that cannot be spawned, as when the process may have no more threads, fails the run with an error naming how many workers started, instead of leaving them waiting for the others at the start; they are abandoned and joined, and no other is spawned. The failure to spawn is reported even when a worker that started has already failed to set up.
 #[test]
 fn a_worker_that_cannot_be_spawned_fails_the_run() {
     for failing in [0, 2] {
-        let abandoned = std::sync::Mutex::new(Vec::new());
-        let error = drive(
-            4,
-            None,
-            0,
-            0,
-            &MonotonicClock::new(),
-            |worker, start| {
-                let setup = match worker {
-                    1 => Err(io::Error::other("injected setup failure")),
-                    _ => Ok(()),
-                };
-                let started = start.arrival(worker).ready(setup);
-                abandoned.lock().unwrap().push((worker, started));
-                None
-            },
-            |worker, builder| match worker == failing {
-                true => Err(io::Error::from_raw_os_error(libc::EAGAIN)),
-                false => Ok(builder),
-            },
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "spawning worker {failing} failed, with {failing} of 4 workers started: {}",
-                io::Error::from_raw_os_error(libc::EAGAIN)
+        within_a_minute(move || {
+            let abandoned = std::sync::Mutex::new(Vec::new());
+            let error = drive(
+                4,
+                None,
+                0,
+                0,
+                &MonotonicClock::new(),
+                |worker, start| {
+                    let setup = match worker {
+                        1 => Err(io::Error::other("injected setup failure")),
+                        _ => Ok(()),
+                    };
+                    let started = start.arrival(worker).ready(setup);
+                    abandoned.lock().unwrap().push((worker, started));
+                    None
+                },
+                |worker, builder, start| {
+                    if worker != failing {
+                        return Ok(builder);
+                    }
+                    // Fail only once worker 1's setup failure is recorded, if it started, so that the spawn failure must take its place.
+                    while failing > 1 && !start.failed() {
+                        std::thread::yield_now();
+                    }
+                    Err(io::Error::from_raw_os_error(libc::EAGAIN))
+                },
             )
-        );
-        let mut abandoned = abandoned.into_inner().unwrap();
-        abandoned.sort_by_key(|(worker, _)| *worker);
-        let expected: Vec<_> = (0..failing).map(|worker| (worker, None)).collect();
-        assert_eq!(abandoned, expected);
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "spawning worker {failing} failed, with {failing} of 4 workers started: {}",
+                    io::Error::from_raw_os_error(libc::EAGAIN)
+                )
+            );
+            let mut abandoned = abandoned.into_inner().unwrap();
+            abandoned.sort_by_key(|(worker, _)| *worker);
+            let expected: Vec<_> = (0..failing).map(|worker| (worker, None)).collect();
+            assert_eq!(abandoned, expected);
+        });
     }
 }
 

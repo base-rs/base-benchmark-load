@@ -135,7 +135,7 @@ fn sleep_until(clock: &MonotonicClock, instant: u64) {
     }
 }
 
-/// Control a run from the calling thread: start `workers` threads, each running `worker`, which reports its setup to the [`Start`] it is given; once all have set up, pin the calling thread to `controller_cpu`, if any, and start them together; measure the window with an [`Interval`]; and collect their results. Returns the start, the controller's sample, and each worker's result. Each worker's thread is spawned from the builder `prepare` returns, given its index and a builder that names it.
+/// Control a run from the calling thread: start `workers` threads, each running `worker`, which reports its setup to the [`Start`] it is given; once all have set up, pin the calling thread to `controller_cpu`, if any, and start them together; measure the window with an [`Interval`]; and collect their results. Returns the start, the controller's sample, and each worker's result. Each worker's thread is spawned from the builder `prepare` returns, given its index, a builder that names it, and the start.
 ///
 /// Fails when a worker's thread cannot be spawned, as when the process may have no more threads or memory; when a worker fails to set up, including when it panics before it reports; or when the controller cannot pin its CPU. The workers that started are released and joined first, so a panic is reported as the error that names its worker.
 fn drive(
@@ -145,15 +145,19 @@ fn drive(
     duration: u64,
     clock: &MonotonicClock,
     worker: impl Fn(usize, &Start) -> Option<WorkerResult> + Sync,
-    prepare: impl Fn(usize, Builder) -> io::Result<Builder>,
+    prepare: impl Fn(usize, Builder, &Start) -> io::Result<Builder>,
 ) -> io::Result<(u64, Sample, Vec<WorkerResult>)> {
     let start = Start::new(workers);
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for index in 0..workers {
             let (worker, start) = (&worker, &start);
-            let spawned = prepare(index, Builder::new().name(format!("load-worker-{index}")))
-                .and_then(|builder| builder.spawn_scoped(scope, move || worker(index, start)));
+            let spawned = prepare(
+                index,
+                Builder::new().name(format!("load-worker-{index}")),
+                start,
+            )
+            .and_then(|builder| builder.spawn_scoped(scope, move || worker(index, start)));
             match spawned {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
@@ -273,7 +277,7 @@ pub fn run(options: &Options) -> io::Result<Report> {
         load.duration,
         &clock,
         |worker, start| work(&load, worker, Epoll::new(), &clock, start),
-        |_, builder| Ok(builder),
+        |_, builder, _| Ok(builder),
     )?;
     let workers: Vec<WorkerReport> = results
         .into_iter()
