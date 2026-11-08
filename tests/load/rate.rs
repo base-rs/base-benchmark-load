@@ -125,7 +125,7 @@ fn a_server_stall_stays_visible_in_open_loop_latency() {
     assert!(intervals[0]["latency_max_ns"].as_f64().unwrap() >= 40.0 * MS);
 }
 
-/// A run whose window ends with requests it planned in it still unsent did not offer its rate in the window, so the run is flagged as saturated, whichever side held the requests back. Here the server stalls the response to the request planned 150 ms into a 200 ms window for 100 ms, so the 49 requests planned after it on the one connection can only be sent after the window, however fast the client is.
+/// A run whose window ends with requests it planned in it still unsent did not offer its rate in the window. Here the server stalls the response to the request planned 150 ms into a 200 ms window for 100 ms, so the 49 requests planned after it on the one connection can only be sent after the window, however fast the client is. Those the worker reached in the window, as it does when it keeps its schedule, its connection held back, which does not saturate the client; any it reached only after the window, it held back itself. The two parts always add up to the shortfall.
 #[test]
 fn requests_planned_in_the_window_but_sent_after_it_are_a_shortfall() {
     let server = Server::start(|arrival| match (arrival.connection, arrival.request) {
@@ -149,21 +149,33 @@ fn requests_planned_in_the_window_but_sent_after_it_are_a_shortfall() {
     .unwrap();
     let record = record(&report);
     assert_eq!(count(&record, "responses_valid"), 200);
-    assert!(report.shortfall() >= 49, "{}", report.shortfall());
-    assert_eq!(
-        count(&record, "sent_in_window_shortfall"),
-        report.shortfall()
+    let (shortfall, schedule, connection) = (
+        report.shortfall(),
+        report.schedule_shortfall(),
+        report.connection_shortfall(),
     );
-    assert_eq!(count(&record, "sent_in_window"), 200 - report.shortfall());
+    assert!(shortfall >= 49, "{shortfall}");
+    assert_eq!(schedule + connection, shortfall);
+    assert_eq!(count(&record, "sent_in_window_shortfall"), shortfall);
+    assert_eq!(count(&record, "schedule_shortfall"), schedule);
+    assert_eq!(count(&record, "connection_shortfall"), connection);
+    assert_eq!(count(&record, "sent_in_window"), 200 - shortfall);
+    // Any part is over the limit of one in a thousand, and judged by which side held the requests back.
+    let held_back = report.held_back();
+    assert_eq!(held_back.is_some(), connection > 0, "{held_back:?}");
     let reasons = report.saturation();
-    assert!(
+    assert_eq!(
         reasons
             .iter()
-            .any(|reason| reason.contains("of the 200 requests planned in the window")),
+            .any(|reason| reason.contains(" in the window than the 200 planned in it")),
+        schedule > 0,
         "{reasons:?}"
     );
-    assert_eq!(metric(&record, "client_saturated"), 1.0);
-    assert!(report.summary().contains("were not sent in it"));
+    assert_eq!(
+        metric(&record, "client_saturated"),
+        f64::from(u8::from(!reasons.is_empty()))
+    );
+    assert_eq!(report.summary().contains(" held back "), connection > 0);
 }
 
 /// With pipelining, requests sent behind the stalled one are on the wire and still wait for it.

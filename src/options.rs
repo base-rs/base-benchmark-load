@@ -45,7 +45,7 @@ Output:
   --connection-details       Include every connection's counters in the record.
   --busy-limit FRACTION      Flag the client as saturated when a worker is busy for more of the window [0.8].
   --schedule-lag-limit DURATION  In rate mode, flag the client as saturated when a worker's 99th percentile schedule lag exceeds this [50us].
-  --shortfall-limit FRACTION In rate mode, flag the client as saturated when more of the requests planned in the window were not sent in it [0.001].
+  --shortfall-limit FRACTION In rate mode, flag the client as saturated when the workers reached more of the requests planned in the window only after it; more that they reached in it but sent after it are reported as held back by the connections, or by the server when the client kept its schedule, without saturating the client [0.001].
   --fail-on CLASSES          Exit unsuccessfully, without a record, on invalid responses, errors, or saturation: a comma-separated list of invalid, errors, saturated.
   --quiet                    Do not write the summary to stderr.
 
@@ -161,7 +161,7 @@ const VALUE_OPTIONS: [&str; 27] = [
 
 /// The default `--busy-limit`. On the measuring host hana, one worker at 120,000 requests per second was busy for 76–77% of the window, with a 99th percentile latency 1.1 times the reference client's; at 140,000 it was busy for 86–88%, with a 99th percentile 1.3 times, and a 99.9th 2 to 3 times, the reference's. `results/2026-11-09-hana` records the evaluation.
 const DEFAULT_BUSY_LIMIT: f64 = 0.8;
-/// The default `--schedule-lag-limit`: twice the largest 99th percentile dispatch lag of hana's healthy runs, 24 µs, which equals the schedule lag when connections have room, as nearly all did. Disturbed runs on aiko had 105 µs to 10 ms.
+/// The default `--schedule-lag-limit`: twice the largest 99th percentile dispatch lag of hana's healthy runs, 24 µs, which equals the schedule lag when connections have room, as nearly all did. Disturbed runs on aiko had 105 µs to 10 ms. It is absolute, whatever the host and the run: a slower or noisier host, or a short or low-rate run, whose few samples put the 99th percentile near the maximum, may need a higher limit, raised with evidence from such runs.
 const DEFAULT_SCHEDULE_LAG_LIMIT: Duration = Duration::from_micros(50);
 /// The default `--shortfall-limit`: one in a thousand planned requests, a backlog growing by a millisecond each second. On hana, runs that kept up sent within 14 requests of their plan in the window, and runs whose median latency reached 5 ms or more fell 0.13% to 12% short.
 const DEFAULT_SHORTFALL_LIMIT: f64 = 0.001;

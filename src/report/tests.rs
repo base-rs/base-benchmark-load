@@ -135,7 +135,8 @@ fn open_loop_records() {
         // Reaching requests planned outside the window is not measured.
         statistics.reached(&timing, 9 * MS, 10 * MS);
         statistics.reached(&timing, 20 * MS, 30 * MS);
-        // One of the ten planned in the window was sent after it, within the limit of one in ten.
+        // Every request planned in the window was reached in it, but one was sent after it, within the limit of one in ten.
+        statistics.reached_in_window = 5;
         statistics.sent_in_window = 5 - index as u64;
         statistics.busy = 2 * MS;
         statistics.last_outcome = Some(21 * MS);
@@ -148,12 +149,25 @@ fn open_loop_records() {
     assert_eq!(report.operations(), 10);
     assert_eq!(report.busy_fractions(), [0.2, 0.2]);
     assert_eq!(report.shortfall(), 1);
+    assert_eq!(
+        (report.schedule_shortfall(), report.connection_shortfall()),
+        (0, 1)
+    );
     assert!(report.saturation().is_empty());
+    assert_eq!(report.held_back(), None);
     let record = report.record().unwrap();
     record.validate().unwrap();
     assert_eq!(record.samples[0].operations, 10);
     assert_eq!(
         value(&record, "sent_in_window_shortfall"),
+        Measurement::Total { value: 1 }
+    );
+    assert_eq!(
+        value(&record, "schedule_shortfall"),
+        Measurement::Total { value: 0 }
+    );
+    assert_eq!(
+        value(&record, "connection_shortfall"),
         Measurement::Total { value: 1 }
     );
     assert_eq!(
@@ -187,6 +201,8 @@ fn open_loop_records() {
         "schedule_lag_p99",
         "schedule_lag_mean",
         "sent_in_window_shortfall",
+        "schedule_shortfall",
+        "connection_shortfall",
         "cpu_time",
         "user_cpu_time",
         "system_cpu_time",
@@ -265,8 +281,11 @@ fn open_loop_records() {
             "busy_limit": 0.9,
             "schedule_lag_limit_ns": 50_000,
             "shortfall_limit": 0.1,
-            "shortfall": 1,
         })
+    );
+    assert_eq!(
+        extension["shortfall"],
+        json!({"sent": 1, "schedule": 0, "connection": 1, "held_back": null})
     );
     assert_eq!(extension["preflight_requests"], 1);
     assert_eq!(extension["intervals"][0]["latency_count"], 8);
@@ -323,9 +342,16 @@ fn closed_loop_records_and_details() {
             .is_none()
     );
     assert_eq!(report.shortfall(), 0);
+    assert_eq!(
+        (report.schedule_shortfall(), report.connection_shortfall()),
+        (0, 0)
+    );
+    for name in ["schedule_shortfall", "connection_shortfall"] {
+        assert!(record.samples[0].metric(name).is_none(), "{name}");
+    }
     let saturation = &record.extensions[EXTENSION]["saturation"];
     assert_eq!(saturation["schedule_lag_limit_ns"], Value::Null);
-    assert_eq!(saturation["shortfall"], Value::Null);
+    assert_eq!(record.extensions[EXTENSION]["shortfall"], Value::Null);
     assert_eq!(
         value(&record, "service_time_max"),
         Measurement::Quantile {
@@ -404,7 +430,8 @@ fn saturation_and_failures() {
         statistics.busy = if index == 0 { 95 * MS / 10 } else { MS };
         // Worker 0 reached its request 60 µs late, worker 1 on time.
         statistics.reached(&timing, 11 * MS, 11 * MS + 60_000 * (1 - index as u64));
-        // Each worker sent four of its five requests planned in the window.
+        // Each worker reached and sent four of its five requests planned in the window.
+        statistics.reached_in_window = 4;
         statistics.sent_in_window = 4;
         complete(&timing, statistics, connection, 11 * MS, 12 * MS);
         statistics.complete(
@@ -439,9 +466,10 @@ fn saturation_and_failures() {
         [
             "worker 0 was busy for 95.0% of the window",
             "worker 0's 99th percentile schedule lag, 60.00 µs, exceeds 50.00 µs",
-            "2 of the 10 requests planned in the window (20.00%) were not sent in it",
+            "the workers reached 2 fewer requests in the window than the 10 planned in it (20.00%)",
         ]
     );
+    assert_eq!(report.held_back(), None);
     let none = FailOn::default();
     assert!(report.failures(none).is_empty());
     let all = FailOn {
@@ -457,7 +485,7 @@ fn saturation_and_failures() {
     );
     assert_eq!(failures.len(), 5);
     assert!(failures[2].starts_with("the client was saturated: worker 0"));
-    assert!(failures[4].starts_with("the client was saturated: 2 of the 10"));
+    assert!(failures[4].starts_with("the client was saturated: the workers reached 2 fewer"));
     let record = report.record().unwrap();
     assert_eq!(
         value(&record, "client_saturated"),
@@ -469,9 +497,203 @@ fn saturation_and_failures() {
     );
     assert!(report.summary().contains("SATURATED: worker 0"));
     assert!(report.summary().contains("problems: 2 invalid (status)"));
-    assert_eq!(record.extensions[EXTENSION]["saturation"]["shortfall"], 2);
+    assert_eq!(record.extensions[EXTENSION]["shortfall"]["schedule"], 2);
     // At the limits, the lag and the shortfall are not reasons.
     report.schedule_lag_limit = 60_000;
     report.shortfall_limit = 0.2;
     assert_eq!(report.saturation().len(), 1);
+}
+
+/// Every worker's schedule lag is judged, not only the first's.
+#[test]
+fn a_late_worker_saturates_the_client_whichever_it_is() {
+    let timing = timing(false);
+    let report = report(Mode::Rate, |index, statistics, _| {
+        statistics.reached(&timing, 11 * MS, 11 * MS + 60_000 * index as u64);
+        // Each worker reached and sent its five requests planned in the window.
+        statistics.reached_in_window = 5;
+        statistics.sent_in_window = 5;
+    });
+    assert_eq!(
+        report.saturation(),
+        ["worker 1's 99th percentile schedule lag, 60.00 µs, exceeds 50.00 µs"]
+    );
+}
+
+/// Requests the workers reached in the window, but whose connections were still awaiting the server's responses at its end, were held back by the server: the window did not carry the offered rate, but the client kept its schedule, so it is not saturated, and `--fail-on saturated` keeps the record.
+#[test]
+fn a_shortfall_the_server_held_back_does_not_saturate_the_client() {
+    let timing = timing(false);
+    let mut report = report(Mode::Rate, |_, statistics, connection| {
+        statistics.reached(&timing, 11 * MS, 11 * MS);
+        statistics.busy = MS;
+        statistics.reached_in_window = 5;
+        // Each worker sent three of the five requests it reached.
+        statistics.sent_in_window = 3;
+        complete(&timing, statistics, connection, 11 * MS, 12 * MS);
+    });
+    assert_eq!(
+        (
+            report.shortfall(),
+            report.schedule_shortfall(),
+            report.connection_shortfall()
+        ),
+        (4, 0, 4)
+    );
+    assert!(report.saturation().is_empty());
+    let held_back = "the server held back 4 requests (40.00% of the 10 planned in the window): the workers reached them in the window, but sent them after it, since their connections were awaiting responses or reconnecting; with 4 × 1 outstanding requests, the connections carry the offered 1000/s only while the round trip stays under 4.000 ms, so if the server's healthy round trip is longer, the run needs more connections or depth";
+    assert_eq!(report.held_back().as_deref(), Some(held_back));
+    let all = FailOn {
+        invalid: true,
+        errors: true,
+        saturated: true,
+    };
+    assert!(report.failures(all).is_empty());
+    let record = report.record().unwrap();
+    assert_eq!(
+        value(&record, "client_saturated"),
+        Measurement::Mean { value: 0.0 }
+    );
+    assert_eq!(
+        value(&record, "connection_shortfall"),
+        Measurement::Total { value: 4 }
+    );
+    let extension = &record.extensions[EXTENSION];
+    assert_eq!(extension["saturation"]["saturated"], false);
+    assert_eq!(extension["shortfall"]["held_back"], held_back);
+    let summary = report.summary();
+    assert!(summary.contains("; not saturated\n"), "{summary}");
+    assert!(
+        summary.contains(&format!("shortfall: {held_back}\n")),
+        "{summary}"
+    );
+    // When the client is saturated too, it may have read the responses that make room late, so the server is not named.
+    report.busy_limit = 0.05;
+    assert_eq!(
+        report.held_back().as_deref(),
+        Some(
+            "the connections (4 × 1 outstanding) held back 4 requests (40.00% of the 10 planned in the window): the workers reached them in the window, but sent them after it, since their connections were awaiting responses or reconnecting; the server is not named, since the client was saturated, so the workers may have read late the responses that make room, and with 4 × 1 outstanding requests, the connections carry the offered 1000/s only while the round trip stays under 4.000 ms"
+        )
+    );
+    // At the limit, it is not held back.
+    report.shortfall_limit = 0.4;
+    assert_eq!(report.held_back(), None);
+    assert!(!report.summary().contains("shortfall:"));
+}
+
+/// A worker that stalls briefly just before the window's end leaves requests on full connections without its busy time or 99th percentile schedule lag showing it, so a worker that reached any request later than the schedule lag limit keeps the server from being named for the requests held back.
+#[test]
+fn a_late_worker_keeps_the_server_from_being_named() {
+    let timing = timing(false);
+    let mut report = report(Mode::Rate, |index, statistics, _| {
+        // Two hundred requests reached on time keep the 99th percentile within the limit; the last, reached 2 ms late, does not.
+        for planned in 0..200 {
+            statistics.reached(&timing, 11 * MS + planned, 11 * MS + planned + 20);
+        }
+        if index == 1 {
+            statistics.reached(&timing, 18 * MS, 20 * MS);
+        }
+        statistics.reached_in_window = 5;
+        statistics.sent_in_window = 3;
+    });
+    assert!(report.saturation().is_empty());
+    assert_eq!(
+        report.held_back().as_deref(),
+        Some(
+            "the connections (4 × 1 outstanding) held back 4 requests (40.00% of the 10 planned in the window): the workers reached them in the window, but sent them after it, since their connections were awaiting responses or reconnecting; the server is not named, since a worker reached a request 2.000 ms late, more than 50.00 µs, so the workers may have read late the responses that make room, and with 4 × 1 outstanding requests, the connections carry the offered 1000/s only while the round trip stays under 4.000 ms"
+        )
+    );
+    // At the limit, the worker kept its schedule, and the server is named, with the connections' capacity, since too few connections for a healthy round trip are full whatever the server does.
+    report.schedule_lag_limit = 2 * MS;
+    report.parameters["connections"] = 1.into();
+    report.parameters["rate"] = 100_000.into();
+    assert_eq!(
+        report.held_back().as_deref(),
+        Some(
+            "the server held back 4 requests (40.00% of the 10 planned in the window): the workers reached them in the window, but sent them after it, since their connections were awaiting responses or reconnecting; with 1 × 1 outstanding request, the connections carry the offered 100000/s only while the round trip stays under 10.00 µs, so if the server's healthy round trip is longer, the run needs more connections or depth"
+        )
+    );
+}
+
+/// Workers that start the window behind their schedule reach more requests in it than were planned in it. Here each reached seven and sent five of its five planned: the window carried its rate, so nothing was held back, and the parts, like the shortfall, are zero.
+#[test]
+fn a_backlog_from_before_the_window_is_not_held_back() {
+    let report = report(Mode::Rate, |_, statistics, _| {
+        statistics.reached_in_window = 7;
+        statistics.sent_in_window = 5;
+    });
+    assert_eq!(
+        (
+            report.shortfall(),
+            report.schedule_shortfall(),
+            report.connection_shortfall()
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(report.held_back(), None);
+    // Sending one fewer of them leaves a shortfall of two, all the connections' part, though the workers reached four more than they sent.
+    let report = self::report(Mode::Rate, |_, statistics, _| {
+        statistics.reached_in_window = 7;
+        statistics.sent_in_window = 4;
+    });
+    assert_eq!(
+        (
+            report.shortfall(),
+            report.schedule_shortfall(),
+            report.connection_shortfall()
+        ),
+        (2, 0, 2)
+    );
+}
+
+/// Workers that send, in the window, a backlog they reached before it send more requests in it than they reach. Here each reached three and sent four of its five planned: the shortfall of two is all the client's part, though the workers reached four fewer than were planned.
+#[test]
+fn a_backlog_sent_in_the_window_leaves_the_schedule_its_part() {
+    let report = report(Mode::Rate, |_, statistics, _| {
+        statistics.reached_in_window = 3;
+        statistics.sent_in_window = 4;
+    });
+    assert_eq!(
+        (
+            report.shortfall(),
+            report.schedule_shortfall(),
+            report.connection_shortfall()
+        ),
+        (2, 2, 0)
+    );
+    assert_eq!(
+        report.saturation(),
+        ["the workers reached 2 fewer requests in the window than the 10 planned in it (20.00%)"]
+    );
+    assert_eq!(report.held_back(), None);
+}
+
+/// One request is a request.
+#[test]
+fn one_request_is_singular() {
+    let mut report = report(Mode::Rate, |index, statistics, _| {
+        statistics.reached_in_window = 5 - index as u64;
+        statistics.sent_in_window = 4 - index as u64;
+    });
+    report.shortfall_limit = 0.01;
+    // The workers reached nine and sent seven of the ten planned.
+    assert_eq!(
+        report.saturation(),
+        ["the workers reached 1 fewer request in the window than the 10 planned in it (10.00%)"]
+    );
+    report.planned = 9;
+    assert!(report.saturation().is_empty());
+    assert!(
+        report
+            .held_back()
+            .unwrap()
+            .starts_with("the server held back 2 requests (22.22% of the 9 planned"),
+    );
+    report.planned = 8;
+    assert!(
+        report
+            .held_back()
+            .unwrap()
+            .starts_with("the server held back 1 request (12.50% of the 8 planned"),
+    );
 }

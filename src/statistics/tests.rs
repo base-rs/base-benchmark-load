@@ -160,6 +160,22 @@ fn sends_in_the_window_are_counted() {
     assert_eq!((statistics.sent, statistics.sent_in_window), (4, 2));
 }
 
+/// A request's schedule lag is measured when it was planned in the window, and its reach is counted when it happened in the window, so that a request planned in the warmup but reached in the window counts as reached in it.
+#[test]
+fn reaches_are_measured_by_plan_and_counted_by_time() {
+    let timing = timing(false);
+    let mut statistics = WorkerStatistics::new(&timing);
+    for (planned, now) in [(108, 111), (109, 112), (112, 113), (119, 121), (120, 121)] {
+        statistics.reached(&timing, planned * MS, now * MS);
+    }
+    assert_eq!(statistics.reached_in_window, 3);
+    let lag = &statistics.distributions.schedule_lag;
+    assert_eq!(
+        (lag.count(), lag.min(), lag.max()),
+        (2, Some(MS), Some(2 * MS))
+    );
+}
+
 #[test]
 fn worker_statistics_merge_exactly() {
     let timing = timing(false);
@@ -195,6 +211,7 @@ fn worker_statistics_merge_exactly() {
         Some(InvalidKind::Header),
         &mut connection,
     );
+    second.reached_in_window = 11;
     second.connects = 2;
     second.connect_errors = 1;
     second.disconnects = 3;
@@ -227,9 +244,10 @@ fn worker_statistics_merge_exactly() {
         (
             merged.sent,
             merged.sent_in_window,
+            merged.reached_in_window,
             merged.completed_in_window
         ),
-        (1, 1, 2)
+        (1, 1, 11, 2)
     );
     assert_eq!(merged.last_outcome, Some(117 * MS));
     assert_eq!(

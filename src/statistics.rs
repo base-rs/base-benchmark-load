@@ -252,6 +252,8 @@ pub struct WorkerStatistics {
     pub intervals: Vec<IntervalStatistics>,
     pub sent: u64,
     pub sent_in_window: u64,
+    /// Requests the worker reached on its schedule in the window, whenever they were planned (open loop).
+    pub reached_in_window: u64,
     pub completed_in_window: u64,
     /// The latest completion or failure of a request, if any.
     pub last_outcome: Option<u64>,
@@ -289,6 +291,7 @@ impl WorkerStatistics {
             intervals,
             sent: 0,
             sent_in_window: 0,
+            reached_in_window: 0,
             completed_in_window: 0,
             last_outcome: None,
             connects: 0,
@@ -320,8 +323,11 @@ impl WorkerStatistics {
         }
     }
 
-    /// Record that the worker reached the request planned at `planned` on its schedule at `now`, if it was planned in the window.
+    /// Record that the worker reached the request planned at `planned` on its schedule at `now`: its schedule lag, if it was planned in the window, and the reach, if it was in the window.
     pub(crate) fn reached(&mut self, timing: &Timing, planned: u64, now: u64) {
+        if timing.in_window(now) {
+            self.reached_in_window += 1;
+        }
         if timing.in_window(planned) {
             self.distributions
                 .schedule_lag
@@ -411,6 +417,7 @@ impl WorkerStatistics {
         }
         self.sent += other.sent;
         self.sent_in_window += other.sent_in_window;
+        self.reached_in_window += other.reached_in_window;
         self.completed_in_window += other.completed_in_window;
         self.last_outcome = self.last_outcome.max(other.last_outcome);
         self.connects += other.connects;
