@@ -170,29 +170,29 @@ impl Report {
         }
     }
 
-    /// The client's part of the [`Report::shortfall`]: how many fewer requests the workers reached on their schedule in the window than were planned in it, which is how much further behind their schedule they were at its end than at its start.
+    /// The client's part of the [`Report::shortfall`]: how many fewer requests the workers reached on their schedule in the window than were planned in it, which is how much further behind their schedule they were at its end than at its start, up to the shortfall.
+    ///
+    /// Every request is reached before it is sent, so with `planned`, `reached`, and `sent` in the window, the shortfall, `planned - sent` or zero, is `planned - reached` plus `reached - sent`. Either difference is negative when the workers caught up, in the window, on a backlog from before it, so each part is its difference clamped to between zero and the shortfall, and the two parts always sum to the shortfall: the parts are the differences when both are positive, and otherwise the positive one, up to the shortfall, is all of it.
     pub fn schedule_shortfall(&self) -> u64 {
-        match self.mode {
-            Mode::Rate => self.planned.saturating_sub(self.total.reached_in_window),
-            Mode::Closed => 0,
-        }
+        self.planned
+            .saturating_sub(self.total.reached_in_window)
+            .min(self.shortfall())
     }
 
-    /// The connections' part of the [`Report::shortfall`], which the server held back unless the client is saturated: how many more requests the workers reached in the window than they sent in it, because their connections had no room, with as many requests outstanding as the depth allows, awaiting responses, or were reconnecting. Every request is reached before it is sent, and the shortfall is the sum of the two parts before each is clamped at zero.
+    /// The connections' part of the [`Report::shortfall`]: how many more requests the workers reached in the window than they sent in it, up to the shortfall, because their connections had no room, with as many requests outstanding as the depth allows, awaiting responses, or were reconnecting. It is the shortfall less the [`Report::schedule_shortfall`].
     pub fn connection_shortfall(&self) -> u64 {
-        match self.mode {
-            Mode::Rate => self
-                .total
-                .reached_in_window
-                .saturating_sub(self.total.sent_in_window),
-            Mode::Closed => 0,
-        }
+        self.shortfall() - self.schedule_shortfall()
     }
 
     /// Whether `shortfall` is more than `--shortfall-limit` of the requests planned in the window, and its share of them.
     fn excessive(&self, shortfall: u64) -> Option<f64> {
         (shortfall as f64 > self.shortfall_limit * self.planned as f64)
             .then(|| shortfall as f64 / self.planned as f64)
+    }
+
+    /// The most any worker was late in reaching a request planned in the window, if any was.
+    fn schedule_lag_max(&self) -> Option<u64> {
+        self.total.distributions.schedule_lag.max()
     }
 
     /// Why the load may not be what the run claims because of the client: busy-polling uses every worker CPU whatever the load, so saturation is judged by busy time, by how late the workers reached due requests, and by whether they reached the window's requests in it.
@@ -223,7 +223,8 @@ impl Report {
         let shortfall = self.schedule_shortfall();
         if let Some(share) = self.excessive(shortfall) {
             reasons.push(format!(
-                "the workers reached {shortfall} fewer requests in the window than the {} planned in it ({:.2}%)",
+                "the workers reached {shortfall} fewer {} in the window than the {} planned in it ({:.2}%)",
+                requests(shortfall),
                 self.planned,
                 share * 100.0
             ));
@@ -231,22 +232,48 @@ impl Report {
         reasons
     }
 
-    /// Why the window did not carry the offered rate other than because the workers fell behind their schedule, if it did not: the workers reached more than `--shortfall-limit` of the requests planned in the window in it, but could send them only after it, because their connections were awaiting responses or reconnecting. The server held them back, unless the client is saturated, when it may have read the responses that make room late. Either way, this is not the client's saturation, so `--fail-on saturated` ignores it.
+    /// Why the window did not carry the offered rate other than because the workers fell behind their schedule, if it did not: the [`Report::connection_shortfall`], which is never more than the shortfall, is more than `--shortfall-limit` of the requests planned in the window. The workers reached those requests in the window, but could send them only after it, because their connections were awaiting responses or reconnecting. This is not the client's saturation, so `--fail-on saturated` ignores it.
+    ///
+    /// The reason names the server only when the client is not saturated and no worker reached any request planned in the window later than `--schedule-lag-limit`, since a worker that stalled, even briefly near the window's end, may have read late the responses that make room. Otherwise it names the connections. Either way it states how many requests the connections may have outstanding, and the round trip under which that many carry the offered rate, since connections too few or too shallow for the server's healthy round trip are full whatever the server does.
     pub fn held_back(&self) -> Option<String> {
         let shortfall = self.connection_shortfall();
         let share = self.excessive(shortfall)?;
-        let (side, responses) = if self.saturation().is_empty() {
-            ("the server", "responses")
-        } else {
-            (
-                "their connections",
-                "responses, which the saturated client may have read late,",
-            )
+        let count = |name: &str| {
+            self.parameters[name]
+                .as_u64()
+                .expect("a rate-mode report's parameters have the rate, connections, and depth")
         };
-        Some(format!(
-            "{side} held back {shortfall} requests ({:.2}% of the {} planned in the window): the workers reached them in the window, but sent them after it, since their connections were awaiting {responses} or reconnecting",
+        let (connections, depth, rate) = (count("connections"), count("depth"), count("rate"));
+        let outstanding = connections * depth;
+        let capacity = format!(
+            "with {connections} × {depth} outstanding {}, the connections carry the offered {rate}/s only while the round trip stays under {}",
+            requests(outstanding),
+            micros((outstanding as f64 * 1e9 / rate as f64) as u64)
+        );
+        let held = format!(
+            "held back {shortfall} {} ({:.2}% of the {} planned in the window): the workers reached them in the window, but sent them after it, since their connections were awaiting responses or reconnecting",
+            requests(shortfall),
             share * 100.0,
             self.planned
+        );
+        let late = self
+            .schedule_lag_max()
+            .filter(|lag| *lag > self.schedule_lag_limit);
+        let distrust = if !self.saturation().is_empty() {
+            "the client was saturated".to_owned()
+        } else if let Some(lag) = late {
+            format!(
+                "a worker reached a request {} late, more than {}",
+                micros(lag),
+                micros(self.schedule_lag_limit)
+            )
+        } else {
+            return Some(format!(
+                "the server {held}; {capacity}, so if the server's healthy round trip is longer, the run needs more connections or depth"
+            ));
+        };
+        Some(format!(
+            "the connections ({connections} × {depth} outstanding) {held}; the server is not named, since {distrust}, so the workers may have read late the responses that make room, and {capacity}"
         ))
     }
 
@@ -697,6 +724,11 @@ impl Report {
             micros(self.window),
         )
     }
+}
+
+/// The noun for `count` requests.
+fn requests(count: u64) -> &'static str {
+    if count == 1 { "request" } else { "requests" }
 }
 
 /// A duration in nanoseconds, in readable units.

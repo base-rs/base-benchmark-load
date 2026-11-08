@@ -125,7 +125,7 @@ fn a_server_stall_stays_visible_in_open_loop_latency() {
     assert!(intervals[0]["latency_max_ns"].as_f64().unwrap() >= 40.0 * MS);
 }
 
-/// A run whose window ends with requests it planned in it still unsent did not offer its rate in the window. Here the server stalls the response to the request planned 150 ms into a 200 ms window for 100 ms, so the 49 requests planned after it on the one connection can only be sent after the window, however fast the client is. Those the worker reached in the window, as it does when it keeps its schedule, the server held back, which does not saturate the client; any it reached only after the window, it held back itself. Without a warmup, every request sent in the window was reached in it, so the two parts add up to the shortfall.
+/// A run whose window ends with requests it planned in it still unsent did not offer its rate in the window. Here the server stalls the response to the request planned 150 ms into a 200 ms window for 100 ms, so the 49 requests planned after it on the one connection can only be sent after the window, however fast the client is. Those the worker reached in the window, as it does when it keeps its schedule, its connection held back, which does not saturate the client; any it reached only after the window, it held back itself. The two parts always add up to the shortfall.
 #[test]
 fn requests_planned_in_the_window_but_sent_after_it_are_a_shortfall() {
     let server = Server::start(|arrival| match (arrival.connection, arrival.request) {
@@ -165,9 +165,9 @@ fn requests_planned_in_the_window_but_sent_after_it_are_a_shortfall() {
     assert_eq!(held_back.is_some(), connection > 0, "{held_back:?}");
     let reasons = report.saturation();
     assert_eq!(
-        reasons.iter().any(
-            |reason| reason.contains("fewer requests in the window than the 200 planned in it")
-        ),
+        reasons
+            .iter()
+            .any(|reason| reason.contains(" in the window than the 200 planned in it")),
         schedule > 0,
         "{reasons:?}"
     );
