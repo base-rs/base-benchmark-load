@@ -16,7 +16,7 @@ use std::{
     net::{SocketAddr, TcpStream},
     os::fd::AsRawFd,
     sync::{
-        Barrier, Mutex, PoisonError,
+        Condvar, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -84,10 +84,65 @@ impl Load<'_> {
 /// The value of [`Start`]'s instant when the run is abandoned before it starts.
 const ABORT: u64 = u64::MAX;
 
+/// A reusable barrier for a number of parties that can be reduced before they meet, for workers that were never started.
+#[derive(Debug)]
+struct Rendezvous {
+    meeting: Mutex<Meeting>,
+    met: Condvar,
+}
+
+#[derive(Debug)]
+struct Meeting {
+    parties: usize,
+    waiting: usize,
+    /// How many times the parties have met.
+    generation: u64,
+}
+
+impl Rendezvous {
+    fn new(parties: usize) -> Self {
+        Self {
+            meeting: Mutex::new(Meeting {
+                parties,
+                waiting: 0,
+                generation: 0,
+            }),
+            met: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Meeting> {
+        self.meeting.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Wait until every party has arrived.
+    fn wait(&self) {
+        let mut meeting = self.lock();
+        meeting.waiting += 1;
+        if meeting.waiting == meeting.parties {
+            meeting.waiting = 0;
+            meeting.generation += 1;
+            self.met.notify_all();
+        } else {
+            let generation = meeting.generation;
+            drop(
+                self.met
+                    .wait_while(meeting, |meeting| meeting.generation == generation)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        }
+    }
+
+    /// Meet with `parties` parties from now on. Call it only while fewer than `parties` are waiting, so that none is left waiting for parties that will not come.
+    fn reduce(&self, parties: usize) {
+        self.lock().parties = parties;
+    }
+}
+
 /// Starts every worker at the same instant, once all have connected. The workers and the controller meet twice: once when every worker has set up, and again when the controller has decided the start or abandoned the run. The start lies far enough ahead that every worker is waiting for it when it arrives.
 #[derive(Debug)]
 pub struct Start {
-    barrier: Barrier,
+    rendezvous: Rendezvous,
     failure: Mutex<Option<io::Error>>,
     instant: AtomicU64,
 }
@@ -95,10 +150,16 @@ pub struct Start {
 impl Start {
     pub fn new(workers: usize) -> Self {
         Self {
-            barrier: Barrier::new(workers + 1),
+            rendezvous: Rendezvous::new(workers + 1),
             failure: Mutex::new(None),
             instant: AtomicU64::new(0),
         }
+    }
+
+    /// Abandon the run because only `started` workers could be started, failing it with `error`: the controller meets only them from now on. Call it before [`Start::wait_for_workers`], which returns `error`, and then [`Start::abort`].
+    pub fn started_only(&self, started: usize, error: io::Error) {
+        self.rendezvous.reduce(started + 1);
+        *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = Some(error);
     }
 
     /// The arrival of worker `worker` at the start, which it reports with [`Arrival::ready`]. Every worker takes one before it sets up.
@@ -117,17 +178,17 @@ impl Start {
                 .unwrap_or_else(PoisonError::into_inner)
                 .get_or_insert(error);
         }
-        self.barrier.wait();
-        self.barrier.wait();
+        self.rendezvous.wait();
+        self.rendezvous.wait();
         match self.instant.load(Ordering::Acquire) {
             ABORT => None,
             start => Some(start),
         }
     }
 
-    /// Wait for every worker's setup, and return the first failure.
+    /// Wait for every started worker's setup, and return the failure: the failure to start every worker, if any, or else the first worker's failure to set up.
     pub fn wait_for_workers(&self) -> Option<io::Error> {
-        self.barrier.wait();
+        self.rendezvous.wait();
         self.failure
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -137,7 +198,7 @@ impl Start {
     /// Start the workers at `start`, once [`Start::wait_for_workers`] has returned. Call it, or [`Start::abort`], exactly once.
     pub fn publish(&self, start: u64) {
         self.instant.store(start, Ordering::Release);
-        self.barrier.wait();
+        self.rendezvous.wait();
     }
 
     pub fn abort(&self) {

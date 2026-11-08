@@ -14,7 +14,7 @@ The record goes to stdout as one line of JSON, and a summary to stderr. `base-be
 
 `--cpus` pins one worker to each CPU it lists. `--controller-cpu` pins the thread that controls the run, which mostly sleeps, to a CPU of its own: it may not be one of `--cpus`. The controller is pinned only after the workers have started, so workers without a CPU of their own keep the affinity the process had, rather than inheriting the controller's. The record lists each worker's CPU and the CPUs it could run on.
 
-Before any load, one **preflight** request on its own connection checks that the server answers with a valid response; its body becomes the body every response must repeat, unless `--body`, `--body-file`, `--any-body`, or `--response-file` says otherwise. Then every worker connects its share of the connections, round-robin, and all start together. A failure up to this point (an address that does not resolve, a refused or invalid preflight, a CPU that cannot be pinned, a connection that cannot be established within `--connect-timeout`) fails the run without a record.
+Before any load, one **preflight** request on its own connection checks that the server answers with a valid response; its body becomes the body every response must repeat, unless `--body`, `--body-file`, `--any-body`, or `--response-file` says otherwise. Then every worker connects its share of the connections, round-robin, and all start together. A failure up to this point (an address that does not resolve, a refused or invalid preflight, a worker thread that cannot be started for lack of threads or memory, a CPU that cannot be pinned, a connection that cannot be established within `--connect-timeout`) fails the run without a record.
 
 ## Modes
 

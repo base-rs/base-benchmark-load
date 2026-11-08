@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use std::{
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
+    thread::Builder,
     time::Duration,
 };
 
@@ -134,9 +135,9 @@ fn sleep_until(clock: &MonotonicClock, instant: u64) {
     }
 }
 
-/// Control a run from the calling thread: start `workers` threads, each running `worker`, which reports its setup to the [`Start`] it is given; once all have set up, pin the calling thread to `controller_cpu`, if any, and start them together; measure the window with an [`Interval`]; and collect their results. Returns the start, the controller's sample, and each worker's result.
+/// Control a run from the calling thread: start `workers` threads, each running `worker`, which reports its setup to the [`Start`] it is given; once all have set up, pin the calling thread to `controller_cpu`, if any, and start them together; measure the window with an [`Interval`]; and collect their results. Returns the start, the controller's sample, and each worker's result. Each worker's thread is spawned from the builder `prepare` returns, given its index and a builder that names it.
 ///
-/// Fails when a worker fails to set up, including when it panics before it reports, or when the controller cannot pin its CPU. Every worker is joined first, so a panic is reported as the error that names its worker.
+/// Fails when a worker's thread cannot be spawned, as when the process may have no more threads or memory; when a worker fails to set up, including when it panics before it reports; or when the controller cannot pin its CPU. The workers that started are released and joined first, so a panic is reported as the error that names its worker.
 fn drive(
     workers: usize,
     controller_cpu: Option<usize>,
@@ -144,18 +145,32 @@ fn drive(
     duration: u64,
     clock: &MonotonicClock,
     worker: impl Fn(usize, &Start) -> Option<WorkerResult> + Sync,
+    prepare: impl Fn(usize, Builder) -> io::Result<Builder>,
 ) -> io::Result<(u64, Sample, Vec<WorkerResult>)> {
     let start = Start::new(workers);
     std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|index| {
-                let (worker, start) = (&worker, &start);
-                std::thread::Builder::new()
-                    .name(format!("load-worker-{index}"))
-                    .spawn_scoped(scope, move || worker(index, start))
-                    .expect("spawning a worker thread succeeds")
-            })
-            .collect();
+        let mut handles = Vec::with_capacity(workers);
+        for index in 0..workers {
+            let (worker, start) = (&worker, &start);
+            let spawned = prepare(index, Builder::new().name(format!("load-worker-{index}")))
+                .and_then(|builder| builder.spawn_scoped(scope, move || worker(index, start)));
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    // The workers that started wait for the others at the start, which they would never reach: abandon the run with them alone.
+                    start.started_only(
+                        index,
+                        io::Error::new(
+                            error.kind(),
+                            format!(
+                                "spawning worker {index} failed, with {index} of {workers} workers started: {error}"
+                            ),
+                        ),
+                    );
+                    break;
+                }
+            }
+        }
         // Pin the controller only once every worker exists: a thread inherits its creator's affinity, so pinning first would confine every worker without a CPU of its own to the controller's CPU.
         let pinned = controller_cpu.map_or(Ok(()), os::pin);
         if let Some(error) = start.wait_for_workers().or(pinned.err()) {
@@ -193,7 +208,7 @@ fn drive(
 
 /// Run the load the options describe, and report what it measured.
 ///
-/// Before the load, one preflight request checks that the server answers with a valid response, within the connect timeout. Fails without measuring when the address does not resolve, the preflight fails, a worker cannot pin its CPU or connect, or panics while setting up, or the calling thread, which controls the run, cannot pin its CPU. Unpinned workers keep the calling thread's affinity from before the run.
+/// Before the load, one preflight request checks that the server answers with a valid response, within the connect timeout. Fails without measuring when the address does not resolve, the preflight fails, a worker's thread cannot be spawned, a worker cannot pin its CPU or connect, or panics while setting up, or the calling thread, which controls the run, cannot pin its CPU. Unpinned workers keep the calling thread's affinity from before the run.
 pub fn run(options: &Options) -> io::Result<Report> {
     let address = resolve(&options.address)?;
     let request = RequestTemplate::new(
@@ -258,6 +273,7 @@ pub fn run(options: &Options) -> io::Result<Report> {
         load.duration,
         &clock,
         |worker, start| work(&load, worker, Epoll::new(), &clock, start),
+        |_, builder| Ok(builder),
     )?;
     let workers: Vec<WorkerReport> = results
         .into_iter()

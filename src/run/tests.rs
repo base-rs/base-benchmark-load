@@ -191,16 +191,68 @@ fn preflight_reads_fail_when_their_timeout_cannot_be_set() {
 /// A worker that panics before it reports its setup fails the run with an error naming it, instead of leaving the controller waiting for it, and the workers that did set up are abandoned.
 #[test]
 fn a_worker_that_panics_while_setting_up_fails_the_run() {
-    let error = drive(2, None, 0, 0, &MonotonicClock::new(), |worker, start| {
-        let arrival = start.arrival(worker);
-        if worker == 1 {
-            panic!("injected failure");
-        }
-        assert_eq!(arrival.ready(Ok(())), None);
-        None
-    })
+    let abandoned = std::sync::Mutex::new(Vec::new());
+    let error = drive(
+        2,
+        None,
+        0,
+        0,
+        &MonotonicClock::new(),
+        |worker, start| {
+            let arrival = start.arrival(worker);
+            if worker == 1 {
+                panic!("injected failure");
+            }
+            let started = arrival.ready(Ok(()));
+            abandoned.lock().unwrap().push((worker, started));
+            None
+        },
+        |_, builder| Ok(builder),
+    )
     .unwrap_err();
     assert_eq!(error.to_string(), "worker 1 panicked while setting up");
+    assert_eq!(*abandoned.lock().unwrap(), [(0, None)]);
+}
+
+/// A worker thread that cannot be spawned, as when the process may have no more threads, fails the run with an error naming how many workers started, instead of leaving them waiting for the others at the start; they are abandoned and joined, and no other is spawned. The failure to spawn is reported even when a worker that started also failed to set up.
+#[test]
+fn a_worker_that_cannot_be_spawned_fails_the_run() {
+    for failing in [0, 2] {
+        let abandoned = std::sync::Mutex::new(Vec::new());
+        let error = drive(
+            4,
+            None,
+            0,
+            0,
+            &MonotonicClock::new(),
+            |worker, start| {
+                let setup = match worker {
+                    1 => Err(io::Error::other("injected setup failure")),
+                    _ => Ok(()),
+                };
+                let started = start.arrival(worker).ready(setup);
+                abandoned.lock().unwrap().push((worker, started));
+                None
+            },
+            |worker, builder| match worker == failing {
+                true => Err(io::Error::from_raw_os_error(libc::EAGAIN)),
+                false => Ok(builder),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "spawning worker {failing} failed, with {failing} of 4 workers started: {}",
+                io::Error::from_raw_os_error(libc::EAGAIN)
+            )
+        );
+        let mut abandoned = abandoned.into_inner().unwrap();
+        abandoned.sort_by_key(|(worker, _)| *worker);
+        let expected: Vec<_> = (0..failing).map(|worker| (worker, None)).collect();
+        assert_eq!(abandoned, expected);
+    }
 }
 
 #[test]
