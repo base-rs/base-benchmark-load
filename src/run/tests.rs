@@ -62,6 +62,35 @@ fn parameters_describe_the_work() {
     );
 }
 
+/// A reader that is interrupted by a signal before every chunk it returns.
+struct Interrupted<'a> {
+    chunks: std::collections::VecDeque<&'a [u8]>,
+    interrupt: bool,
+}
+
+impl Read for Interrupted<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.interrupt = !self.interrupt;
+        if self.interrupt {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let chunk = self.chunks.pop_front().unwrap_or_default();
+        buffer[..chunk.len()].copy_from_slice(chunk);
+        Ok(chunk.len())
+    }
+}
+
+#[test]
+fn preflight_reads_are_retried_when_interrupted() {
+    let request = RequestTemplate::new("GET", "/", "host", &[], b"");
+    let reader = Interrupted {
+        chunks: [&b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no"[..], b"k"].into(),
+        interrupt: false,
+    };
+    let response = read_response(reader, &request, &expectation(None, None)).unwrap();
+    assert_eq!(response.body.as_deref(), Some(&b"ok"[..]));
+}
+
 #[test]
 fn sleeping_until_a_past_instant_returns_at_once() {
     let clock = MonotonicClock::new();

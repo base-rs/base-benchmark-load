@@ -45,8 +45,9 @@ pub fn preflight(
         })
 }
 
+/// Read the preflight response. A read interrupted by a signal is retried: with a read timeout set, Linux never restarts it, whatever the signal's disposition.
 fn read_response(
-    mut stream: TcpStream,
+    mut stream: impl Read,
     request: &RequestTemplate,
     expectation: &Expectation,
 ) -> io::Result<Response> {
@@ -54,7 +55,10 @@ fn read_response(
     let mut buffer = Vec::new();
     let mut chunk = [0; 16 * 1024];
     loop {
-        let read = stream.read(&mut chunk)?;
+        let read = match stream.read(&mut chunk) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            read => read?,
+        };
         if read == 0 {
             return parser.at_eof(expectation).ok_or(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
