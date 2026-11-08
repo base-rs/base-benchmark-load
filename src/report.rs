@@ -6,7 +6,7 @@ use crate::{
     options::{FailOn, Mode},
     statistics::{ConnectionCounters, ErrorKind, InvalidKind, Outcomes, Period, WorkerStatistics},
 };
-use base_benchmark::{Metric, Phase, ProcessRecord, Sample, Unit};
+use base_benchmark::{Direction, Metric, Phase, ProcessRecord, Sample, Source, Unit};
 use serde_json::{Map, Value, json};
 use std::{fmt::Write as _, io};
 
@@ -22,6 +22,8 @@ const QUANTILES: [(&str, f64); 5] = [
     ("p999", 0.999),
     ("max", 1.0),
 ];
+/// The distribution of the client's own delay in sending, a diagnostic of the client rather than a property of the server.
+const DISPATCH_LAG: &str = "dispatch_lag";
 
 /// The 64-bit FNV-1a digest of `bytes`, in hexadecimal: a compact identity for request templates and expected bodies.
 pub fn digest(bytes: &[u8]) -> String {
@@ -225,18 +227,18 @@ impl Report {
                 ("latency", &distributions.latency),
                 ("round_trip", &distributions.round_trip),
                 ("send_delay", &distributions.send_delay),
-                ("dispatch_lag", &distributions.dispatch_lag),
+                (DISPATCH_LAG, &distributions.dispatch_lag),
             ],
             Mode::Closed => vec![
                 ("service_time", &distributions.round_trip),
-                ("dispatch_lag", &distributions.dispatch_lag),
+                (DISPATCH_LAG, &distributions.dispatch_lag),
             ],
         }
     }
 
     /// The `base-benchmark` process record, with one sample over the measured window.
     ///
-    /// Totals of the measured phase are divided by the operations in `base-benchmark` summaries, and only properties of the server have a direction: diagnostics of the client, such as its busy time and saturation, are neutral, since a faster server makes the client busier.
+    /// Totals of the measured phase are divided by the operations in `base-benchmark` summaries, and only properties of the server have a direction: its timings, wall time per success, invalid responses, and errors are lower-is-better. Diagnostics of the client, such as its CPU time, context switches, dispatch lag, busy time, and saturation, are neutral, since a faster server makes the client busier.
     ///
     /// Fails when there are no operations to normalize by: a run without a single valid response in the measured period.
     pub fn record(&self) -> io::Result<ProcessRecord> {
@@ -252,6 +254,12 @@ impl Report {
         }
         let mut sample = self.sample.clone();
         sample.operations = operations;
+        // The controller's interval measures this process: its CPU time and context switches describe the client, not the server, so they are neutral. Its wall time per success is the inverse of the throughput, and keeps its direction.
+        for metric in &mut sample.metrics {
+            if metric.source == Source::Rusage {
+                metric.direction = Direction::Neutral;
+            }
+        }
         let measured = self.total.period(Period::Measured);
         let count = |name: &str, value: u64| Metric::total(name, Unit::Count, value);
         sample.push(count("responses_valid", measured.valid));
@@ -288,23 +296,32 @@ impl Report {
         sample.push(count("sent_in_window", self.total.sent_in_window));
         // Every valid response of the measured period is in every distribution, so none is empty.
         const NONEMPTY: &str = "a record has valid responses, which every distribution holds";
+        // The server's timings are lower-is-better; the client's dispatch lag is neutral.
+        let direction = |name: &str, metric: Metric| {
+            if name == DISPATCH_LAG {
+                metric
+            } else {
+                metric.lower_is_better()
+            }
+        };
         for (name, histogram) in self.distributions() {
             for (suffix, quantile) in QUANTILES {
                 let value = histogram.value_at_quantile(quantile).expect(NONEMPTY);
-                sample.push(
+                sample.push(direction(
+                    name,
                     Metric::quantile(
                         format!("{name}_{suffix}"),
                         Unit::Nanoseconds,
                         quantile,
                         value as f64,
-                    )
-                    .lower_is_better(),
-                );
+                    ),
+                ));
             }
             let mean = histogram.mean().expect(NONEMPTY);
-            sample.push(
-                Metric::mean(format!("{name}_mean"), Unit::Nanoseconds, mean).lower_is_better(),
-            );
+            sample.push(direction(
+                name,
+                Metric::mean(format!("{name}_mean"), Unit::Nanoseconds, mean),
+            ));
         }
         let drain = self
             .total

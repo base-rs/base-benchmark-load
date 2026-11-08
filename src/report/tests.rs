@@ -118,7 +118,7 @@ fn durations_read_well() {
 #[test]
 fn open_loop_records() {
     let timing = timing(false);
-    let report = report(Mode::Rate, |index, statistics, connection| {
+    let mut report = report(Mode::Rate, |index, statistics, connection| {
         for planned in [11, 12, 13, 14, 15] {
             complete(
                 &timing,
@@ -131,6 +131,11 @@ fn open_loop_records() {
         statistics.busy = 2 * MS;
         statistics.last_outcome = Some(21 * MS);
     });
+    // The controller's interval, as a run measures it.
+    report.sample = base_benchmark::Interval::start()
+        .unwrap()
+        .finish(1)
+        .unwrap();
     assert_eq!(report.operations(), 10);
     assert_eq!(report.busy_fractions(), [0.2, 0.2]);
     assert!(report.saturation().is_empty());
@@ -156,14 +161,26 @@ fn open_loop_records() {
         "worker_busy_time_max",
         "connection_completions_min",
         "drain_time",
+        "dispatch_lag_p99",
+        "dispatch_lag_mean",
+        "cpu_time",
+        "user_cpu_time",
+        "system_cpu_time",
+        "voluntary_context_switches",
+        "involuntary_context_switches",
     ] {
         assert_eq!(direction(name), Direction::Neutral, "{name}");
     }
     for name in [
+        "wall_time",
         "responses_invalid",
         "errors",
         "errors_timeout",
+        "connect_errors",
         "latency_p99",
+        "latency_mean",
+        "round_trip_p99",
+        "send_delay_max",
     ] {
         assert_eq!(direction(name), Direction::LowerIsBetter, "{name}");
     }
@@ -255,6 +272,9 @@ fn closed_loop_records_and_details() {
     let record = report.record().unwrap();
     assert!(record.samples[0].metric("latency_p50").is_none());
     assert!(record.samples[0].metric("requests_planned").is_none());
+    let direction = |name: &str| record.samples[0].metric(name).unwrap().direction;
+    assert_eq!(direction("service_time_p99"), Direction::LowerIsBetter);
+    assert_eq!(direction("dispatch_lag_p99"), Direction::Neutral);
     assert_eq!(
         value(&record, "service_time_max"),
         Measurement::Quantile {
