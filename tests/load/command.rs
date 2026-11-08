@@ -139,6 +139,7 @@ fn fail_on_classes_suppress_the_record() {
     );
 }
 
+/// The server never answers, so there is no valid response whether or not a request was sent in the short window.
 #[test]
 fn closed_loops_without_a_valid_response_fail() {
     let server = Server::start(|arrival| {

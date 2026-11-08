@@ -79,10 +79,18 @@ fn a_closed_loop_without_a_valid_response_has_no_record() {
         }
         Action::Respond(response)
     });
+    // A closed loop sends only in its window, so the window is only a watchdog: the client would have to stall for all of it to send nothing.
     let report = load(
         "closed",
         server.address,
-        &["--connections", "1", "--warmup", "0", "--duration", "50ms"],
+        &[
+            "--connections",
+            "1",
+            "--warmup",
+            "0",
+            "--duration",
+            CLOSED_WINDOW,
+        ],
     )
     .unwrap();
     let error = report.record().unwrap_err();
@@ -90,7 +98,7 @@ fn a_closed_loop_without_a_valid_response_has_no_record() {
         error.to_string(),
         "no valid response completed in the measured window"
     );
-    // The first request is answered, in the window or in the drain after it, however slowly; every answer is invalid.
+    // Every request sent is answered, in the window or in the drain after it, however slowly; every answer is invalid.
     let statistics = report.statistics();
     let invalid: u64 = Period::ALL
         .iter()

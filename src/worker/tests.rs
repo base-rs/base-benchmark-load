@@ -167,6 +167,8 @@ fn an_open_loop_worker_runs_its_schedule_on_its_clock() {
     let listener = listener();
     let mut load = fixture.load(listener.local_addr().unwrap(), 1);
     load.timeout = 2 * MS;
+    // The clock advances with every iteration while a reconnection waits for the kernel, so the drain timeout, like the connect timeout, is only a watchdog: ten million reads.
+    load.drain_timeout = 100_000 * MS;
     let clock = StepClock::new(0, 10_000);
     let start = Start::new(1);
     let result = std::thread::scope(|scope| {
