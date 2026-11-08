@@ -620,3 +620,13 @@ fn the_drain_deadline_abandons_what_is_left() {
     );
     assert_eq!(statistics.finished(), 0);
 }
+
+/// Reducing a rendezvous to as many parties as are already waiting would leave them waiting forever, since only an arriving party finds every party waiting.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "reduced only to more parties than are waiting")]
+fn a_rendezvous_is_not_reduced_to_the_parties_waiting() {
+    let rendezvous = Rendezvous::new(2);
+    rendezvous.lock().waiting = 1;
+    rendezvous.reduce(1);
+}

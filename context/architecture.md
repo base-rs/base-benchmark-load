@@ -26,7 +26,7 @@ Sockets are registered edge-triggered for reading, writing, and closing, once. A
 
 ## Timing and periods
 
-The controller and the workers meet at a barrier twice: once every worker has pinned itself and connected, and again once the controller has published the start, or abandoned the run because a worker or the controller failed to set up. The start is 100 ms after the first meeting, so every worker is waiting for it when it arrives. The warmup and window follow from it: `[start, start + warmup)` and `[start + warmup, start + warmup + duration)`. The drain deadline is `--drain-timeout` after the window. Rate-mode outcomes belong to the period of their planned time, closed-mode outcomes to the period they happen in.
+The controller and the workers meet at a barrier twice: once every worker has pinned itself and connected, and again once the controller has published the start, or abandoned the run because a worker or the controller failed to set up. When a worker's thread cannot be spawned, the workers already started are waiting at the first meeting for the others, so the controller lowers the meeting's parties to them and itself, and abandons the run. The start is 100 ms after the first meeting, so every worker is waiting for it when it arrives. The warmup and window follow from it: `[start, start + warmup)` and `[start + warmup, start + warmup + duration)`. The drain deadline is `--drain-timeout` after the window. Rate-mode outcomes belong to the period of their planned time, closed-mode outcomes to the period they happen in.
 
 ## Window markers
 
