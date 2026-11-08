@@ -22,8 +22,8 @@ const QUANTILES: [(&str, f64); 5] = [
     ("p999", 0.999),
     ("max", 1.0),
 ];
-/// The distribution of the client's own delay in sending, a diagnostic of the client rather than a property of the server.
-const DISPATCH_LAG: &str = "dispatch_lag";
+/// The distributions of the client's own delays, diagnostics of the client rather than properties of the server.
+const CLIENT_DISTRIBUTIONS: [&str; 2] = ["dispatch_lag", "schedule_lag"];
 
 /// The 64-bit FNV-1a digest of `bytes`, in hexadecimal: a compact identity for request templates and expected bodies.
 pub fn digest(bytes: &[u8]) -> String {
@@ -106,6 +106,8 @@ pub struct WorkerReport {
     pub affinity: Vec<usize>,
     pub statistics: WorkerStatistics,
     pub connections: Vec<ConnectionCounters>,
+    /// The time its CPU spent in software interrupts over the controller's window, when it was pinned and `/proc/stat` could be read. Its thread's CPU time leaves this out, though on loopback much of it is the kernel delivering the worker's own packets.
+    pub softirq: Option<u64>,
 }
 
 /// Merge the workers' statistics exactly.
@@ -134,7 +136,8 @@ pub struct Report {
     pub(crate) window_end: u64,
     pub(crate) interval: u64,
     pub(crate) busy_limit: f64,
-    pub(crate) dispatch_lag_limit: Option<u64>,
+    pub(crate) schedule_lag_limit: u64,
+    pub(crate) shortfall_limit: f64,
     pub(crate) connection_details: bool,
     /// The requests sent before the load, which have no outcome in the record.
     pub(crate) preflight_requests: u64,
@@ -159,7 +162,15 @@ impl Report {
             .collect()
     }
 
-    /// Why the client may have limited the load: busy-polling uses every worker CPU whatever the load, so saturation is judged by busy time and dispatch lag instead.
+    /// How many of the requests planned in the window were not sent in it, in the open loop: how much the backlog of requests due but unsent grew over the window. A run that keeps up has about the same backlog at both ends of it.
+    pub fn shortfall(&self) -> u64 {
+        match self.mode {
+            Mode::Rate => self.planned.saturating_sub(self.total.sent_in_window),
+            Mode::Closed => 0,
+        }
+    }
+
+    /// Why the load may not be what the run claims: busy-polling uses every worker CPU whatever the load, so saturation is judged by busy time, by how late the workers reached due requests, and by whether the window's requests were sent in it.
     pub fn saturation(&self) -> Vec<String> {
         let mut reasons = Vec::new();
         for (index, busy) in self.busy_fractions().into_iter().enumerate() {
@@ -170,19 +181,27 @@ impl Report {
                 ));
             }
         }
-        let lag = self
-            .total
-            .distributions
-            .dispatch_lag
-            .value_at_quantile(0.99);
-        if let (Some(lag), Some(limit)) = (lag, self.dispatch_lag_limit) {
-            if lag > limit {
+        for (index, worker) in self.workers.iter().enumerate() {
+            let lag = worker
+                .statistics
+                .distributions
+                .schedule_lag
+                .value_at_quantile(0.99);
+            if let Some(lag) = lag.filter(|lag| *lag > self.schedule_lag_limit) {
                 reasons.push(format!(
-                    "the 99th percentile dispatch lag, {}, exceeds {}",
+                    "worker {index}'s 99th percentile schedule lag, {}, exceeds {}",
                     micros(lag),
-                    micros(limit)
+                    micros(self.schedule_lag_limit)
                 ));
             }
+        }
+        let shortfall = self.shortfall();
+        if shortfall as f64 > self.shortfall_limit * self.planned as f64 {
+            reasons.push(format!(
+                "{shortfall} of the {} requests planned in the window ({:.2}%) were not sent in it",
+                self.planned,
+                shortfall as f64 * 100.0 / self.planned as f64
+            ));
         }
         reasons
     }
@@ -227,18 +246,19 @@ impl Report {
                 ("latency", &distributions.latency),
                 ("round_trip", &distributions.round_trip),
                 ("send_delay", &distributions.send_delay),
-                (DISPATCH_LAG, &distributions.dispatch_lag),
+                ("dispatch_lag", &distributions.dispatch_lag),
+                ("schedule_lag", &distributions.schedule_lag),
             ],
             Mode::Closed => vec![
                 ("service_time", &distributions.round_trip),
-                (DISPATCH_LAG, &distributions.dispatch_lag),
+                ("dispatch_lag", &distributions.dispatch_lag),
             ],
         }
     }
 
     /// The `base-benchmark` process record, with one sample over the measured window.
     ///
-    /// Totals of the measured phase are divided by the operations in `base-benchmark` summaries, and only properties of the server have a direction: its timings, wall time per success, invalid responses, and errors are lower-is-better. Diagnostics of the client, such as its CPU time, context switches, dispatch lag, busy time, and saturation, are neutral, since a faster server makes the client busier.
+    /// Totals of the measured phase are divided by the operations in `base-benchmark` summaries, and only properties of the server have a direction: its timings, wall time per success, invalid responses, and errors are lower-is-better. Diagnostics of the client, such as its CPU time, context switches, dispatch and schedule lag, busy time, the shortfall, and saturation, are neutral, since a faster server makes the client busier.
     ///
     /// Fails when there are no operations to normalize by: a run without a single valid response in the measured period.
     pub fn record(&self) -> io::Result<ProcessRecord> {
@@ -294,11 +314,14 @@ impl Report {
         // Per operation, these are the completions and sends per valid response, which describe the run rather than rank servers; throughput is the inverse of `wall_time` per operation.
         sample.push(count("completed_in_window", self.total.completed_in_window));
         sample.push(count("sent_in_window", self.total.sent_in_window));
-        // Every valid response of the measured period is in every distribution, so none is empty.
+        if self.mode == Mode::Rate {
+            sample.push(count("sent_in_window_shortfall", self.shortfall()));
+        }
+        // Every valid response of the measured period is in every distribution, and the schedule lag holds every request planned in the window, which a valid response of the cohort was, so none is empty.
         const NONEMPTY: &str = "a record has valid responses, which every distribution holds";
-        // The server's timings are lower-is-better; the client's dispatch lag is neutral.
+        // The server's timings are lower-is-better; the client's delays are neutral.
         let direction = |name: &str, metric: Metric| {
-            if name == DISPATCH_LAG {
+            if CLIENT_DISTRIBUTIONS.contains(&name) {
                 metric
             } else {
                 metric.lower_is_better()
@@ -439,7 +462,9 @@ impl Report {
                     "iterations": statistics.iterations,
                     "sent": statistics.sent,
                     "completed_in_window": statistics.completed_in_window,
+                    "softirq_ns": worker.softirq,
                     "dispatch_lag_p99_ns": statistics.distributions.dispatch_lag.value_at_quantile(0.99),
+                    "schedule_lag_p99_ns": statistics.distributions.schedule_lag.value_at_quantile(0.99),
                 })
             })
             .collect();
@@ -488,7 +513,9 @@ impl Report {
                 "saturated": !saturation.is_empty(),
                 "reasons": saturation,
                 "busy_limit": self.busy_limit,
-                "dispatch_lag_limit_ns": self.dispatch_lag_limit,
+                "schedule_lag_limit_ns": (self.mode == Mode::Rate).then_some(self.schedule_lag_limit),
+                "shortfall_limit": (self.mode == Mode::Rate).then_some(self.shortfall_limit),
+                "shortfall": (self.mode == Mode::Rate).then_some(self.shortfall()),
             },
             "workers": workers,
             "intervals": intervals,

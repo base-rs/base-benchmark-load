@@ -92,3 +92,22 @@ fn the_clock_source_is_named() {
         assert!(!source.ends_with('\n'));
     }
 }
+
+#[test]
+fn softirq_times_are_read_per_cpu() {
+    let stat = "cpu  10 0 10 100 0 0 30 0 0 0\n\
+                cpu0 1 2 3 4 5 6 7 8 9 10\n\
+                cpu2 0 0 0 0 0 0 250 0\n\
+                cpu3 0 0 0\n\
+                cpu4 0 0 0 0 0 0 many 0\n\
+                \n\
+                intr 1 2 3 4 5 6 7 8\n";
+    // The total line, short or malformed lines, and other counters are left out.
+    assert_eq!(
+        softirq_from_stat(stat, 100).into_iter().collect::<Vec<_>>(),
+        [(0, 70_000_000), (2, 2_500_000_000)]
+    );
+    // This host's CPUs, of which the calling thread may run on at least one.
+    let times = softirq_times().unwrap();
+    assert!(affinity().iter().any(|cpu| times.contains_key(cpu)));
+}

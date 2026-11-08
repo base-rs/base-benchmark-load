@@ -1,9 +1,10 @@
 // Released under the MIT License.
 // Copyright, 2026, by Samuel Williams.
 
-//! The Linux calls the standard library does not offer: CPU affinity, thread CPU time, the descriptor limit, and non-blocking connects.
+//! The Linux calls the standard library does not offer: CPU affinity, thread CPU time, the descriptor limit, non-blocking connects, and each CPU's software interrupt time.
 
 use std::{
+    collections::BTreeMap,
     io,
     net::{SocketAddr, TcpStream},
     os::fd::{FromRawFd, OwnedFd},
@@ -142,6 +143,25 @@ pub fn clock_source() -> Option<String> {
     std::fs::read_to_string("/sys/devices/system/clocksource/clocksource0/current_clocksource")
         .ok()
         .map(|source| source.trim().to_owned())
+}
+
+/// Each online CPU's time in software interrupts since boot, in nanoseconds, by CPU number, from `/proc/stat`.
+pub fn softirq_times() -> io::Result<BTreeMap<usize, u64>> {
+    // SAFETY: `sysconf` has no preconditions; `_SC_CLK_TCK` is always defined on Linux.
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+    std::fs::read_to_string("/proc/stat").map(|stat| softirq_from_stat(&stat, ticks_per_second))
+}
+
+/// Each CPU's software interrupt time in `stat`, the text of `/proc/stat`, whose times count `ticks_per_second` ticks a second. The `softirq` field is the seventh of a `cpuN` line, after `user`, `nice`, `system`, `idle`, `iowait`, and `irq`.
+pub(crate) fn softirq_from_stat(stat: &str, ticks_per_second: u64) -> BTreeMap<usize, u64> {
+    stat.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            let cpu = fields.next()?.strip_prefix("cpu")?.parse().ok()?;
+            let ticks: u64 = fields.nth(6)?.parse().ok()?;
+            Some((cpu, ticks.saturating_mul(1_000_000_000) / ticks_per_second))
+        })
+        .collect()
 }
 
 #[cfg(test)]

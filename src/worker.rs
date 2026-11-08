@@ -353,13 +353,17 @@ pub fn work<P: Poller, C: Clock>(
         }
         while now >= next_due {
             let local = cursor.local();
+            let planned = next_due;
             cursor.advance();
             next_due = due_time(&cursor);
             let due = cursor.ordinal().min(settings.total);
+            // The worker reaches the request now, whether or not its connection has room to send it: how late this is measures the worker alone, however long its connection's last response waited to be read.
+            let reached = clock.now();
+            statistics.reached(&settings.timing, planned, reached);
             send(
                 &mut connections[local],
                 &mut poller,
-                clock.now(),
+                reached,
                 due,
                 &settings,
                 &mut statistics,
@@ -506,7 +510,7 @@ fn handle<P: Poller>(
         State::Open => {
             let mut result = Ok(());
             if event.readable || event.closed {
-                result = connection.readable(clock, settings, statistics);
+                result = connection.readable(clock, event.closed, settings, statistics);
             }
             let result = result.and_then(|()| {
                 connection.dispatch(clock.now(), due, settings, statistics);

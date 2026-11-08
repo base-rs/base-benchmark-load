@@ -214,8 +214,10 @@ pub struct Distributions {
     pub round_trip: Histogram,
     /// Actual minus planned send time (open loop).
     pub send_delay: Histogram,
-    /// Actual send minus the time the request became eligible to send: the client's own delay.
+    /// Actual send minus the time the request became eligible to send, the later of its planned time and the moment the worker found its connection had room, by reading the response that freed it. It leaves out how long that response waited to be read, so it falls as a worker falls behind; [`Distributions::schedule_lag`] does not.
     pub dispatch_lag: Histogram,
+    /// The time from each planned send to the moment the worker reached it on its schedule, whether or not its connection had room (open loop). Unlike the others, it covers every request planned in the window, whatever its outcome.
+    pub schedule_lag: Histogram,
 }
 
 impl Default for Distributions {
@@ -226,6 +228,7 @@ impl Default for Distributions {
             round_trip: histogram(),
             send_delay: histogram(),
             dispatch_lag: histogram(),
+            schedule_lag: histogram(),
         }
     }
 }
@@ -236,6 +239,7 @@ impl Distributions {
         self.round_trip.merge(&other.round_trip);
         self.send_delay.merge(&other.send_delay);
         self.dispatch_lag.merge(&other.dispatch_lag);
+        self.schedule_lag.merge(&other.schedule_lag);
     }
 }
 
@@ -313,6 +317,15 @@ impl WorkerStatistics {
         self.sent += 1;
         if timing.in_window(now) {
             self.sent_in_window += 1;
+        }
+    }
+
+    /// Record that the worker reached the request planned at `planned` on its schedule at `now`, if it was planned in the window.
+    pub(crate) fn reached(&mut self, timing: &Timing, planned: u64, now: u64) {
+        if timing.in_window(planned) {
+            self.distributions
+                .schedule_lag
+                .record(now.saturating_sub(planned));
         }
     }
 

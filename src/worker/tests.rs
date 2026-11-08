@@ -546,6 +546,112 @@ fn open_connections_read_only_when_readable_or_closed() {
     assert_eq!(connection.state, State::Down { until: 3 * MS });
 }
 
+/// Wait for events on `poller` and handle each, with `due` as the open loop's cursor, until `until` holds. The wait is only a watchdog: each event the test expects comes from something it already did, so a wait that finds none means the event was never given.
+fn handle_until(
+    connection: &mut Connection<TcpStream>,
+    poller: &mut Epoll,
+    settings: &Settings,
+    statistics: &mut WorkerStatistics,
+    until: impl Fn(&Connection<TcpStream>, &WorkerStatistics) -> bool,
+) {
+    let mut events = [Event::default(); EVENT_CAPACITY];
+    let clock = StepClock::new(3 * MS, 0);
+    while !until(connection, statistics) {
+        let count = poller.wait(&mut events, 10_000).unwrap();
+        assert!(count > 0, "the socket gave no event");
+        for event in &events[..count] {
+            handle(connection, poller, event, &clock, 2, settings, statistics);
+        }
+    }
+}
+
+/// A read that returns less than it was offered ends the read without another that would only find the socket empty, so the kernel's edge semantics must give whatever arrives later an event of its own: a response written after the read, and a close that arrives after the event that reported the data, even before the data is read. A close that arrives with the data is reported by the same event, which reads on to the end of the stream.
+#[test]
+fn edges_follow_a_short_read() {
+    let fixture = Fixture::new();
+    let listener = listener();
+    let address = listener.local_addr().unwrap();
+    let mut load = fixture.load(address, 1);
+    load.depth = 3;
+    let settings = load.settings(MS);
+    let valid = |count: u64| {
+        move |_: &Connection<TcpStream>, statistics: &WorkerStatistics| {
+            statistics.period(Period::Measured).valid == count
+        }
+    };
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    for close_with_data in [false, true] {
+        let mut poller = Epoll::new().unwrap();
+        let mut statistics = WorkerStatistics::new(&settings.timing);
+        let mut connection = connecting(address, &mut poller);
+        let (mut accepted, _) = listener.accept().unwrap();
+        // The connection completes and sends ordinals 0 and 1, the only ones due.
+        handle_until(
+            &mut connection,
+            &mut poller,
+            &settings,
+            &mut statistics,
+            |connection, _| connection.in_flight.len() == 2,
+        );
+        let mut requests = vec![0; 2 * fixture.request.bytes.len()];
+        accepted.read_exact(&mut requests).unwrap();
+        // The first response is read on its own event, with a read shorter than the buffer.
+        accepted.write_all(response).unwrap();
+        handle_until(
+            &mut connection,
+            &mut poller,
+            &settings,
+            &mut statistics,
+            valid(1),
+        );
+        let stream = connection.stream.as_ref().unwrap();
+        if close_with_data {
+            // The second response and the close both arrive before their event, which reports the close.
+            accepted.write_all(response).unwrap();
+            drop(accepted);
+            wait_for(stream, libc::POLLRDHUP);
+        } else {
+            // The second response arrives after the read; once its event is reported, the close arrives before the response is read.
+            accepted.write_all(response).unwrap();
+            wait_for(stream, libc::POLLIN);
+            let mut events = [Event::default(); EVENT_CAPACITY];
+            let mut reported = Vec::new();
+            while !reported.iter().any(|event: &Event| event.readable) {
+                let count = poller.wait(&mut events, 10_000).unwrap();
+                assert!(count > 0, "the second response gave no event");
+                reported.extend_from_slice(&events[..count]);
+            }
+            assert!(reported.iter().all(|event| !event.closed));
+            drop(accepted);
+            wait_for(stream, libc::POLLRDHUP);
+            let clock = StepClock::new(3 * MS, 0);
+            for event in &reported {
+                handle(
+                    &mut connection,
+                    &mut poller,
+                    event,
+                    &clock,
+                    2,
+                    &settings,
+                    &mut statistics,
+                );
+            }
+            assert_eq!(statistics.period(Period::Measured).valid, 2);
+            assert_eq!(connection.state, State::Open);
+        }
+        // Either way, the end of the stream is found.
+        handle_until(
+            &mut connection,
+            &mut poller,
+            &settings,
+            &mut statistics,
+            |connection, _| connection.state != State::Open,
+        );
+        assert_eq!(statistics.period(Period::Measured).valid, 2);
+        assert_eq!(statistics.disconnects, 1);
+    }
+}
+
 #[test]
 fn maintenance_times_out_connections_and_retries_failed_ones() {
     let fixture = Fixture::new();

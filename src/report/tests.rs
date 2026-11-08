@@ -33,6 +33,8 @@ fn report(
                 affinity: vec![index + 2],
                 statistics,
                 connections: vec![connection, ConnectionCounters::default()],
+                // The second worker's CPU time in software interrupts could not be read.
+                softirq: (index == 0).then_some(3 * MS),
             }
         })
         .collect();
@@ -48,7 +50,8 @@ fn report(
         window_end: 20 * MS,
         interval: 5 * MS,
         busy_limit: 0.9,
-        dispatch_lag_limit: None,
+        schedule_lag_limit: 50_000,
+        shortfall_limit: 0.1,
         connection_details: false,
         preflight_requests: 1,
         context: json!({"version": "test"}),
@@ -120,6 +123,7 @@ fn open_loop_records() {
     let timing = timing(false);
     let mut report = report(Mode::Rate, |index, statistics, connection| {
         for planned in [11, 12, 13, 14, 15] {
+            statistics.reached(&timing, planned * MS, planned * MS + 20);
             complete(
                 &timing,
                 statistics,
@@ -128,6 +132,11 @@ fn open_loop_records() {
                 planned * MS + 1000 * (index as u64 + 1),
             );
         }
+        // Reaching requests planned outside the window is not measured.
+        statistics.reached(&timing, 9 * MS, 10 * MS);
+        statistics.reached(&timing, 20 * MS, 30 * MS);
+        // One of the ten planned in the window was sent after it, within the limit of one in ten.
+        statistics.sent_in_window = 5 - index as u64;
         statistics.busy = 2 * MS;
         statistics.last_outcome = Some(21 * MS);
     });
@@ -138,10 +147,22 @@ fn open_loop_records() {
         .unwrap();
     assert_eq!(report.operations(), 10);
     assert_eq!(report.busy_fractions(), [0.2, 0.2]);
+    assert_eq!(report.shortfall(), 1);
     assert!(report.saturation().is_empty());
     let record = report.record().unwrap();
     record.validate().unwrap();
     assert_eq!(record.samples[0].operations, 10);
+    assert_eq!(
+        value(&record, "sent_in_window_shortfall"),
+        Measurement::Total { value: 1 }
+    );
+    assert_eq!(
+        value(&record, "schedule_lag_max"),
+        Measurement::Quantile {
+            quantile: 1.0,
+            value: 20.0
+        }
+    );
     assert_eq!(
         value(&record, "responses_valid"),
         Measurement::Total { value: 10 }
@@ -163,6 +184,9 @@ fn open_loop_records() {
         "drain_time",
         "dispatch_lag_p99",
         "dispatch_lag_mean",
+        "schedule_lag_p99",
+        "schedule_lag_mean",
+        "sent_in_window_shortfall",
         "cpu_time",
         "user_cpu_time",
         "system_cpu_time",
@@ -229,6 +253,21 @@ fn open_loop_records() {
     assert_eq!(extension["planned"], 10);
     assert_eq!(extension["workers"][1]["cpu"], 3);
     assert_eq!(extension["workers"][1]["affinity"], json!([3]));
+    assert_eq!(extension["workers"][0]["softirq_ns"], 3 * MS);
+    assert_eq!(extension["workers"][1]["softirq_ns"], Value::Null);
+    assert_eq!(extension["workers"][1]["schedule_lag_p99_ns"], 20);
+    assert_eq!(extension["histograms"]["schedule_lag"]["count"], 10);
+    assert_eq!(
+        extension["saturation"],
+        json!({
+            "saturated": false,
+            "reasons": [],
+            "busy_limit": 0.9,
+            "schedule_lag_limit_ns": 50_000,
+            "shortfall_limit": 0.1,
+            "shortfall": 1,
+        })
+    );
     assert_eq!(extension["preflight_requests"], 1);
     assert_eq!(extension["intervals"][0]["latency_count"], 8);
     assert_eq!(extension["intervals"][1]["offset_ns"], 5 * MS);
@@ -242,6 +281,7 @@ fn open_loop_records() {
     assert!(summary.starts_with("base-benchmark-load rate: 1000/s offered over 4 connections, depth 1, 2 workers; 10.000 ms warmup, 10.000 ms measured"), "{summary}");
     assert!(summary.contains("measured cohort: 10 planned; 10 valid"));
     assert!(summary.contains("latency: p50 1.00 µs"));
+    assert!(summary.contains("schedule_lag: p50 0.02 µs"), "{summary}");
     assert!(summary.contains("drained in 1.000 ms"));
     assert!(summary.contains("workers busy: 20% 20%; not saturated"));
     assert!(!summary.contains("problems"));
@@ -275,6 +315,17 @@ fn closed_loop_records_and_details() {
     let direction = |name: &str| record.samples[0].metric(name).unwrap().direction;
     assert_eq!(direction("service_time_p99"), Direction::LowerIsBetter);
     assert_eq!(direction("dispatch_lag_p99"), Direction::Neutral);
+    // The closed loop has no schedule, so no schedule lag, shortfall, or limits on them.
+    assert!(record.samples[0].metric("schedule_lag_p99").is_none());
+    assert!(
+        record.samples[0]
+            .metric("sent_in_window_shortfall")
+            .is_none()
+    );
+    assert_eq!(report.shortfall(), 0);
+    let saturation = &record.extensions[EXTENSION]["saturation"];
+    assert_eq!(saturation["schedule_lag_limit_ns"], Value::Null);
+    assert_eq!(saturation["shortfall"], Value::Null);
     assert_eq!(
         value(&record, "service_time_max"),
         Measurement::Quantile {
@@ -351,6 +402,10 @@ fn saturation_and_failures() {
     let timing = timing(false);
     let mut report = report(Mode::Rate, |index, statistics, connection| {
         statistics.busy = if index == 0 { 95 * MS / 10 } else { MS };
+        // Worker 0 reached its request 60 µs late, worker 1 on time.
+        statistics.reached(&timing, 11 * MS, 11 * MS + 60_000 * (1 - index as u64));
+        // Each worker sent four of its five requests planned in the window.
+        statistics.sent_in_window = 4;
         complete(&timing, statistics, connection, 11 * MS, 12 * MS);
         statistics.complete(
             &timing,
@@ -378,13 +433,13 @@ fn saturation_and_failures() {
         );
         statistics.connect_errors = 1;
     });
-    report.dispatch_lag_limit = Some(10);
     let saturation = report.saturation();
     assert_eq!(
         saturation,
         [
             "worker 0 was busy for 95.0% of the window",
-            "the 99th percentile dispatch lag, 0.05 µs, exceeds 0.01 µs"
+            "worker 0's 99th percentile schedule lag, 60.00 µs, exceeds 50.00 µs",
+            "2 of the 10 requests planned in the window (20.00%) were not sent in it",
         ]
     );
     let none = FailOn::default();
@@ -400,8 +455,9 @@ fn saturation_and_failures() {
         failures[1],
         "2 failed requests and 2 failed connection attempts"
     );
-    assert_eq!(failures.len(), 4);
+    assert_eq!(failures.len(), 5);
     assert!(failures[2].starts_with("the client was saturated: worker 0"));
+    assert!(failures[4].starts_with("the client was saturated: 2 of the 10"));
     let record = report.record().unwrap();
     assert_eq!(
         value(&record, "client_saturated"),
@@ -413,7 +469,9 @@ fn saturation_and_failures() {
     );
     assert!(report.summary().contains("SATURATED: worker 0"));
     assert!(report.summary().contains("problems: 2 invalid (status)"));
-    // The lag limit alone does not apply without a measured lag.
-    report.dispatch_lag_limit = Some(1_000_000_000);
+    assert_eq!(record.extensions[EXTENSION]["saturation"]["shortfall"], 2);
+    // At the limits, the lag and the shortfall are not reasons.
+    report.schedule_lag_limit = 60_000;
+    report.shortfall_limit = 0.2;
     assert_eq!(report.saturation().len(), 1);
 }

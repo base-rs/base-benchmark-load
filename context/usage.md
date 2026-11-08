@@ -24,16 +24,19 @@ Before any load, one **preflight** request on its own connection checks that the
 
 In both modes, operations are successful requests only, as `base-benchmark` requires of a driver, so time per operation is the inverse of the throughput the server achieved, and errors per operation are errors per success. A run without a valid response in the measured period has no operations: it writes its summary, then fails without a record.
 
-Rate mode reports four distributions of the cohort's valid responses:
+Rate mode reports four distributions of the cohort's valid responses, and one of every request planned in the window:
 
 | Distribution | From | To |
 | --- | --- | --- |
 | `latency` | planned send | complete response |
 | `round_trip` | actual send | complete response |
 | `send_delay` | planned send | actual send |
-| `dispatch_lag` | the later of the planned send and the moment the connection had room | actual send |
+| `dispatch_lag` | the later of the planned send and the moment the worker found the connection had room | actual send |
+| `schedule_lag` | planned send | the moment the worker reached the request on its schedule, whether or not its connection had room |
 
-`latency` includes the time a request waited behind a slow one, so a server stall stays visible in every request it delayed; `round_trip` does not. Percentiles of the components do not add up to percentiles of `latency`. `dispatch_lag` measures the client's own delay; closed mode reports it too.
+`latency` includes the time a request waited behind a slow one, so a server stall stays visible in every request it delayed; `round_trip` does not. Percentiles of the components do not add up to percentiles of `latency`.
+
+The two lags are the client's own delays. `schedule_lag` is how late the worker was in getting to each due request: the length of the loop iterations it was busy with, or the time its thread could not run, as when another process preempted it. A server cannot delay it, and it rises steadily with the worker's load. `dispatch_lag` is how long the worker took to send a request once it knew it could: a connection gains room when the worker reads the response that frees it, so a response that waited to be read, because the worker was busy with others, counts as the connection having had no room. It is the schedule lag of requests whose connection had room when they fell due, and nearly zero for the others, so as a worker falls behind and more connections are full, it falls instead of rising: on one overloaded core, its 99th percentile fell from 180 µs to 1.5 µs while latency rose to hundreds of milliseconds. Only `schedule_lag` judges saturation. Closed mode, which has no schedule, reports `dispatch_lag` alone, and there it is nearly zero, since a connection sends as soon as the worker reads the response that freed it.
 
 ## Outcomes
 
@@ -61,7 +64,15 @@ Each is far beyond what a benchmarked server sends, so reaching one means the by
 
 ## Saturation
 
-Busy-polling uses every worker CPU fully whatever the load, so CPU time cannot show whether the client limited the load. Each worker reports the time it spent in loop iterations that did work, against idle polls, and its dispatch lag. The client is flagged as saturated when a worker was busy for more than `--busy-limit` (0.9) of the window, or when the 99th percentile dispatch lag exceeds `--dispatch-lag-limit`. A saturated open-loop run did not offer the rate it claims.
+Busy-polling uses every worker CPU fully whatever the load, so CPU time cannot show whether the client limited the load. Each worker reports the time it spent in loop iterations that did work, against idle polls, and its schedule lag. The client is flagged as saturated, with each reason in the summary and the record, when:
+
+- a worker was busy for more than `--busy-limit` (0.8) of the window;
+- in rate mode, a worker's 99th percentile schedule lag exceeds `--schedule-lag-limit` (50 µs);
+- in rate mode, more than `--shortfall-limit` (0.001) of the requests planned in the window were not sent in it. The difference between the requests planned in the window and those sent in it, `sent_in_window_shortfall`, is how much the backlog of requests due but unsent grew over the window, which stays within a few requests when the run keeps up. A server that falls behind grows it too, since a connection waits for each response before its next request, and then latency shows the server's part; either way, the window did not carry the rate it claims.
+
+A saturated open-loop run did not offer the rate it claims. The defaults come from [an evaluation on a measuring host](../results/2026-11-09-hana/readme.md), with one worker against a raw server: at 120,000 requests per second the worker was busy for 76–77% of the window and latency quantiles were within 1.1 times the reference client's; at 140,000 it was busy for 86–88%, with a 99th percentile 1.3 times, and a 99.9th 2 to 3 times, the reference's. The healthy runs' 99th percentile dispatch lag, which equals the schedule lag when connections have room, as nearly all do at those loads, was at most 24 µs; the schedule lag limit is twice that. The busy limit is conservative on a faster host, where a worker can be busier before its latency suffers: on a Ryzen 9950X3D, a worker busy for 82–85% of the window at 500,000 requests per second kept its 99th percentile within the reference client's. Raise it for such a host with evidence from it, rather than for one result.
+
+A worker's CPU time (`cpu_ns`) is its thread's, and leaves out the time its CPU spends in software interrupts, which the kernel charges to no thread: on loopback, much of it delivers the worker's own packets, about a fifth of a busy client CPU in the evaluation. Each pinned worker reports its CPU's software interrupt time over the controller's window, from `/proc/stat`, as `softirq_ns`. It counts in ticks of the kernel's `USER_HZ`, usually 10 ms, and includes whatever else interrupted that CPU. The controller's process `cpu_time` leaves it out too.
 
 ## The record
 
@@ -72,13 +83,14 @@ The sample covers the window. Its metrics are:
 - the controller's `Interval`: `wall_time`, process `cpu_time`, `user_cpu_time` and `system_cpu_time`, and context switches. The controller starts and stops it when it wakes at the window's boundaries, which the workers time exactly;
 - counts of the measured period: `responses_valid`, `requests_planned` (rate mode), `responses_invalid`, `invalid_KIND`, `errors`, `errors_KIND`, and `connect_errors` (over the whole run);
 - `completed_in_window` and `sent_in_window`, by completion and send time;
+- `sent_in_window_shortfall` (rate mode): the requests planned in the window less those sent in it, or zero when more were sent;
 - for each distribution, quantiles `NAME_p50`, `_p90`, `_p99`, `_p999`, and `_max`, and `NAME_mean`, in nanoseconds;
 - `drain_time`, from the end of the window to the last outcome;
 - `client_saturated` (0 or 1), `worker_busy_time_max`, and `connection_completions_min` and `_max`.
 
-`base-benchmark` divides the measured counts by the operations, so they read per valid response: `errors` is errors per success, and `requests_planned` the planned requests per success. Only properties of the server have a direction. Lower is better for `wall_time`, which per success is the inverse of the throughput; the `latency`, `round_trip`, `send_delay`, and `service_time` distributions, since a request waits to be sent mostly behind a slow response; `responses_invalid` and `invalid_KIND`; `errors` and `errors_KIND`; and `connect_errors`. Every other metric is a diagnostic of the client, and neutral: the controller's `cpu_time`, `user_cpu_time`, `system_cpu_time`, and context switches, which measure this process; the `dispatch_lag` distribution; `responses_valid` and `requests_planned`; the counts in the window; `drain_time`; `client_saturated`; `worker_busy_time_max`; and the connection completions. In the closed loop a faster server makes the client busier, so read saturation as a reason to distrust a result, not as a difference between servers.
+`base-benchmark` divides the measured counts by the operations, so they read per valid response: `errors` is errors per success, and `requests_planned` the planned requests per success. Only properties of the server have a direction. Lower is better for `wall_time`, which per success is the inverse of the throughput; the `latency`, `round_trip`, `send_delay`, and `service_time` distributions, since a request waits to be sent mostly behind a slow response; `responses_invalid` and `invalid_KIND`; `errors` and `errors_KIND`; and `connect_errors`. Every other metric is a diagnostic of the client, and neutral: the controller's `cpu_time`, `user_cpu_time`, `system_cpu_time`, and context switches, which measure this process; the `dispatch_lag` and `schedule_lag` distributions; `responses_valid` and `requests_planned`; the counts in the window and the shortfall; `drain_time`; `client_saturated`; `worker_busy_time_max`; and the connection completions. In the closed loop a faster server makes the client busier, so read saturation as a reason to distrust a result, not as a difference between servers.
 
-The `base-benchmark-load` extension holds the context (version, clock source, address, CPUs, and the descriptor limit in effect), `preflight_requests`, the requests sent before the load, which have no outcome, so a server's own request count is the sum of every period's outcomes and these; the outcomes of every period, connection counts, bytes, fairness (minimum, median, maximum, mean, coefficient of variation, Jain's index, and zeros, of completions per connection, mean latency per connection, and completions per worker), each worker's CPU, the CPUs it could run on, busy fraction, CPU time, and dispatch lag, per-interval completions and latency quantiles (`--interval`), the full histograms as `[lowest value, count]` buckets with their precision, and with `--connection-details`, every connection's counters.
+The `base-benchmark-load` extension holds the context (version, clock source, address, CPUs, and the descriptor limit in effect), `preflight_requests`, the requests sent before the load, which have no outcome, so a server's own request count is the sum of every period's outcomes and these; the outcomes of every period, connection counts, bytes, fairness (minimum, median, maximum, mean, coefficient of variation, Jain's index, and zeros, of completions per connection, mean latency per connection, and completions per worker), the saturation reasons and the limits that judged them, each worker's CPU, the CPUs it could run on, busy fraction, CPU time, its CPU's software interrupt time, and 99th percentile dispatch and schedule lag, per-interval completions and latency quantiles (`--interval`), the full histograms as `[lowest value, count]` buckets with their precision, and with `--connection-details`, every connection's counters.
 
 Histograms have three significant digits, with HdrHistogram's bucketing: a quantile is the highest value of the bucket holding it, clamped to the exact minimum and maximum. Merging per-worker histograms is exact.
 

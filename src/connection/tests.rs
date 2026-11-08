@@ -11,16 +11,19 @@ const MS: u64 = 1_000_000;
 /// The start of the test runs, so that times before it are representable.
 const START: u64 = 1000 * MS;
 
-/// A scripted stream: reads return the queued chunks, then would block; writes accept everything unless a result is queued.
+/// A scripted stream: reads return the queued chunks, one a read, then would block; writes accept everything unless a result is queued. Each chunk stands for what arrived before one read, so a chunk that follows another arrived after the read that took it, and would give an edge-triggered socket another event.
 #[derive(Debug, Default)]
 struct Script {
     reads: VecDeque<io::Result<Vec<u8>>>,
+    /// How many reads were made.
+    read_calls: usize,
     writes: VecDeque<io::Result<usize>>,
     written: Vec<u8>,
 }
 
 impl Read for Script {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.read_calls += 1;
         match self.reads.pop_front() {
             None => Err(io::ErrorKind::WouldBlock.into()),
             Some(Err(error)) => Err(error),
@@ -151,7 +154,7 @@ fn open_loop_requests_record_their_timeline_exactly() {
         .push_back(Ok(RESPONSE.to_vec()));
     let clock = StepClock::new(sent + 1000, 0);
     connection
-        .readable(&clock, &settings, &mut statistics)
+        .readable(&clock, false, &settings, &mut statistics)
         .unwrap();
     let distributions = &statistics.distributions;
     assert_eq!(distributions.latency.max(), Some(1300));
@@ -185,7 +188,12 @@ fn a_late_response_delays_the_connections_later_requests_without_moving_their_sc
         .push_back(Ok(RESPONSE.to_vec()));
     let completed = START + 7 * MS + MS / 2;
     connection
-        .readable(&StepClock::new(completed, 0), &settings, &mut statistics)
+        .readable(
+            &StepClock::new(completed, 0),
+            false,
+            &settings,
+            &mut statistics,
+        )
         .unwrap();
     // The backlog is sent one at a time, as each response arrives, 200 ns after it.
     for ordinal in 3..8u64 {
@@ -198,7 +206,12 @@ fn a_late_response_delays_the_connections_later_requests_without_moving_their_sc
             .reads
             .push_back(Ok(RESPONSE.to_vec()));
         connection
-            .readable(&StepClock::new(sent + 800, 0), &settings, &mut statistics)
+            .readable(
+                &StepClock::new(sent + 800, 0),
+                false,
+                &settings,
+                &mut statistics,
+            )
             .unwrap();
     }
     let distributions = &statistics.distributions;
@@ -225,16 +238,22 @@ fn pipelined_requests_complete_from_one_read() {
         connection.stream.as_ref().unwrap().written,
         REQUEST.repeat(3)
     );
-    // Three responses, the last split across reads.
+    // Three responses, the last split across reads: its tail arrives after the read that took the rest, and has an event of its own.
     let mut bytes = RESPONSE.repeat(3);
     let tail = bytes.split_off(bytes.len() - 5);
     let stream = connection.stream.as_mut().unwrap();
     stream.reads.push_back(Ok(bytes));
     stream.reads.push_back(Ok(tail));
+    let clock = StepClock::new(sent + 100, 10);
     connection
-        .readable(&StepClock::new(sent + 100, 10), &settings, &mut statistics)
+        .readable(&clock, false, &settings, &mut statistics)
+        .unwrap();
+    assert_eq!(connection.in_flight.len(), 1);
+    connection
+        .readable(&clock, false, &settings, &mut statistics)
         .unwrap();
     assert!(connection.in_flight.is_empty());
+    assert_eq!(connection.stream.as_ref().unwrap().read_calls, 2);
     assert_eq!(statistics.period(Period::Measured).valid, 3);
     // Ordinals 2, 3, and 4 were planned 2, 1, and 0 ms before they were sent together.
     assert_eq!(statistics.distributions.send_delay.max(), Some(2 * MS));
@@ -264,6 +283,33 @@ fn writes_continue_after_a_full_send_buffer() {
         connection.stream.as_ref().unwrap().written,
         REQUEST.repeat(2)
     );
+}
+
+/// A read that returns less than the buffer offered found nothing more queued, so the connection waits for the next event instead of reading again only to find that the socket would block. Whatever arrives later gives the socket that event. A spurious event, for bytes an earlier read already took, finds nothing to read.
+#[test]
+fn a_short_read_waits_for_the_next_event() {
+    let fixture = Fixture::new();
+    let settings = fixture.rate(1, 2);
+    let (mut connection, mut statistics) = open_measured(&settings, script([RESPONSE, RESPONSE]));
+    connection.dispatch(START + 3 * MS, 12, &settings, &mut statistics);
+    let clock = StepClock::new(START + 4 * MS, 0);
+    let reads = |connection: &Connection<Script>| connection.stream.as_ref().unwrap().read_calls;
+    for (event, valid) in [(1, 1), (2, 2), (3, 2)] {
+        connection
+            .readable(&clock, false, &settings, &mut statistics)
+            .unwrap();
+        assert_eq!(reads(&connection), event);
+        assert_eq!(statistics.period(Period::Measured).valid, valid);
+    }
+    // Reported with the close, the same response is followed by the end of the stream, which no later event would report.
+    let (mut connection, mut statistics) = open_measured(&settings, script([RESPONSE, b""]));
+    connection.dispatch(START + 3 * MS, 12, &settings, &mut statistics);
+    assert_eq!(
+        connection.readable(&clock, true, &settings, &mut statistics),
+        Err(ErrorKind::Eof)
+    );
+    assert_eq!(reads(&connection), 2);
+    assert_eq!(statistics.period(Period::Measured).valid, 1);
 }
 
 #[test]
@@ -303,7 +349,7 @@ fn read_failures_are_classified() {
         script.reads = VecDeque::from([Err(io::ErrorKind::Interrupted.into()), Err(error.into())]);
         let (mut connection, mut statistics) = open(&settings, script, START);
         assert_eq!(
-            connection.readable(&StepClock::new(START, 1), &settings, &mut statistics),
+            connection.readable(&StepClock::new(START, 1), false, &settings, &mut statistics),
             Err(kind)
         );
     }
@@ -313,13 +359,13 @@ fn read_failures_are_classified() {
 fn failures_are_charged_to_every_outstanding_request() {
     let fixture = Fixture::new();
     let settings = fixture.rate(1, 4);
-    // A response, then the end of the stream with three requests outstanding.
+    // A response, then the end of the stream with three requests outstanding, reported by one event.
     let (mut connection, mut statistics) = open(&settings, script([RESPONSE, b""]), START);
     connection.next_ordinal = 1;
     connection.dispatch(START + 5 * MS, 12, &settings, &mut statistics);
     let now = START + 6 * MS;
     let kind = connection
-        .readable(&StepClock::new(now, 0), &settings, &mut statistics)
+        .readable(&StepClock::new(now, 0), true, &settings, &mut statistics)
         .unwrap_err();
     assert_eq!(kind, ErrorKind::Eof);
     assert_eq!(statistics.idle_closes, 0);
@@ -344,7 +390,7 @@ fn a_server_closing_an_idle_connection_is_not_a_request_error() {
     let settings = fixture.rate(1, 1);
     let (mut connection, mut statistics) = open(&settings, script([&b""[..]]), START);
     assert_eq!(
-        connection.readable(&StepClock::new(START, 0), &settings, &mut statistics),
+        connection.readable(&StepClock::new(START, 0), false, &settings, &mut statistics),
         Err(ErrorKind::Eof)
     );
     connection.fail(ErrorKind::Eof, START, &settings, &mut statistics);
@@ -358,14 +404,14 @@ fn unsolicited_and_malformed_bytes_are_parse_errors() {
     let settings = fixture.rate(1, 1);
     let (mut connection, mut statistics) = open(&settings, script([RESPONSE]), START);
     assert_eq!(
-        connection.readable(&StepClock::new(START, 0), &settings, &mut statistics),
+        connection.readable(&StepClock::new(START, 0), false, &settings, &mut statistics),
         Err(ErrorKind::Parse)
     );
     let (mut connection, mut statistics) =
         open(&settings, script([&b"HTTP/1.1 2000\r\n\r\n"[..]]), START);
     connection.dispatch(START + 3 * MS, 12, &settings, &mut statistics);
     assert_eq!(
-        connection.readable(&StepClock::new(START, 0), &settings, &mut statistics),
+        connection.readable(&StepClock::new(START, 0), false, &settings, &mut statistics),
         Err(ErrorKind::Parse)
     );
 }
@@ -379,7 +425,7 @@ fn a_closing_response_ends_the_connection_after_it_completes() {
     connection.dispatch(START + 3 * MS, 12, &settings, &mut statistics);
     let now = START + 4 * MS;
     let kind = connection
-        .readable(&StepClock::new(now, 0), &settings, &mut statistics)
+        .readable(&StepClock::new(now, 0), false, &settings, &mut statistics)
         .unwrap_err();
     assert_eq!(kind, ErrorKind::Closed);
     connection.fail(kind, now, &settings, &mut statistics);
@@ -403,9 +449,14 @@ fn close_delimited_responses_complete_at_the_end_of_the_stream() {
         connection.dispatch(START + 3 * MS, 12, &settings, &mut statistics),
         2
     );
+    // The body's last byte and the close arrive together, after the head and the first byte; their event reports the close.
     let now = START + 4 * MS;
+    let clock = StepClock::new(now, 0);
+    connection
+        .readable(&clock, false, &settings, &mut statistics)
+        .unwrap();
     let kind = connection
-        .readable(&StepClock::new(now, 0), &settings, &mut statistics)
+        .readable(&clock, true, &settings, &mut statistics)
         .unwrap_err();
     assert_eq!(kind, ErrorKind::Closed);
     connection.fail(kind, now, &settings, &mut statistics);
@@ -433,6 +484,7 @@ fn invalid_responses_are_counted_apart_from_latency() {
     connection
         .readable(
             &StepClock::new(START + 4 * MS, 0),
+            false,
             &settings,
             &mut statistics,
         )
@@ -462,6 +514,7 @@ fn large_heads_grow_the_input_buffer() {
     connection
         .readable(
             &StepClock::new(START + 4 * MS, 0),
+            false,
             &settings,
             &mut statistics,
         )
@@ -530,7 +583,12 @@ fn closed_loop_requests_continue_until_the_window_ends() {
         .push_back(Ok(RESPONSE.repeat(2)));
     // Completed in the warmup.
     connection
-        .readable(&StepClock::new(START + MS, 0), &settings, &mut statistics)
+        .readable(
+            &StepClock::new(START + MS, 0),
+            false,
+            &settings,
+            &mut statistics,
+        )
         .unwrap();
     assert_eq!(
         connection.dispatch(START + MS + 10, 0, &settings, &mut statistics),
@@ -546,6 +604,7 @@ fn closed_loop_requests_continue_until_the_window_ends() {
     connection
         .readable(
             &StepClock::new(START + 3 * MS, 0),
+            false,
             &settings,
             &mut statistics,
         )
@@ -565,7 +624,7 @@ fn closed_loop_requests_continue_until_the_window_ends() {
         .reads
         .push_back(Ok(RESPONSE.to_vec()));
     connection
-        .readable(&StepClock::new(end, 0), &settings, &mut statistics)
+        .readable(&StepClock::new(end, 0), false, &settings, &mut statistics)
         .unwrap();
     let periods = [Period::Warmup, Period::Measured, Period::Drain]
         .map(|period| statistics.period(period).valid);
