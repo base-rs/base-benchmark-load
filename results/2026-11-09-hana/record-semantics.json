@@ -1,0 +1,412 @@
+{
+ "records_checked": 115,
+ "problems": [],
+ "notes": {
+  "rate records with exact cohort and mean decomposition": 83
+ },
+ "wall_time_minus_duration_ns": {
+  "min": -2864529,
+  "median": -582130,
+  "max": 328906
+ },
+ "throughput_from_wall_time_relative_error": {
+  "min": -4.111155977004621e-05,
+  "median": 7.401447773758285e-05,
+  "max": 0.0003581943822743572
+ },
+ "groups": [
+  {
+   "group": [
+    "closed",
+    "closed",
+    1,
+    null
+   ],
+   "records": 10,
+   "backends": [
+    "base-native",
+    "hyper-tokio"
+   ],
+   "distinct_addresses": 10,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "closed",
+    "closed",
+    16,
+    null
+   ],
+   "records": 10,
+   "backends": [
+    "base-native",
+    "hyper-tokio"
+   ],
+   "distinct_addresses": 10,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "closed",
+    "closed",
+    64,
+    null
+   ],
+   "records": 10,
+   "backends": [
+    "base-native",
+    "hyper-tokio"
+   ],
+   "distinct_addresses": 10,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "rate",
+    "rate",
+    64,
+    100000
+   ],
+   "records": 10,
+   "backends": [
+    "base-iouring-raw",
+    "tokio-task-raw"
+   ],
+   "distinct_addresses": 10,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "rate",
+    "rate",
+    64,
+    140000
+   ],
+   "records": 10,
+   "backends": [
+    "base-iouring-raw",
+    "tokio-task-raw"
+   ],
+   "distinct_addresses": 10,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "rate",
+    "rate",
+    64,
+    160000
+   ],
+   "records": 10,
+   "backends": [
+    "base-iouring-raw",
+    "tokio-task-raw"
+   ],
+   "distinct_addresses": 10,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "rate",
+    "rate",
+    64,
+    200000
+   ],
+   "records": 10,
+   "backends": [
+    "base-iouring-raw",
+    "tokio-task-raw"
+   ],
+   "distinct_addresses": 10,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "saturation",
+    "rate",
+    64,
+    120000
+   ],
+   "records": 3,
+   "backends": [
+    "base-iouring-raw"
+   ],
+   "distinct_addresses": 3,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "saturation",
+    "rate",
+    64,
+    150000
+   ],
+   "records": 3,
+   "backends": [
+    "base-iouring-raw"
+   ],
+   "distinct_addresses": 3,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "saturation",
+    "rate",
+    64,
+    170000
+   ],
+   "records": 3,
+   "backends": [
+    "base-iouring-raw"
+   ],
+   "distinct_addresses": 3,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "saturation",
+    "rate",
+    64,
+    190000
+   ],
+   "records": 3,
+   "backends": [
+    "base-iouring-raw"
+   ],
+   "distinct_addresses": 3,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "saturation",
+    "rate",
+    64,
+    205000
+   ],
+   "records": 3,
+   "backends": [
+    "base-iouring-raw"
+   ],
+   "distinct_addresses": 3,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "saturation",
+    "rate",
+    64,
+    215000
+   ],
+   "records": 3,
+   "backends": [
+    "base-iouring-raw"
+   ],
+   "distinct_addresses": 3,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "saturation",
+    "rate",
+    64,
+    230000
+   ],
+   "records": 3,
+   "backends": [
+    "base-iouring-raw"
+   ],
+   "distinct_addresses": 3,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "sweep",
+    "rate",
+    64,
+    100000
+   ],
+   "records": 2,
+   "backends": [
+    "base-iouring-raw",
+    "tokio-task-raw"
+   ],
+   "distinct_addresses": 2,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "sweep",
+    "rate",
+    64,
+    140000
+   ],
+   "records": 2,
+   "backends": [
+    "base-iouring-raw",
+    "tokio-task-raw"
+   ],
+   "distinct_addresses": 2,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "sweep",
+    "rate",
+    64,
+    160000
+   ],
+   "records": 2,
+   "backends": [
+    "base-iouring-raw",
+    "tokio-task-raw"
+   ],
+   "distinct_addresses": 2,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "sweep",
+    "rate",
+    64,
+    180000
+   ],
+   "records": 2,
+   "backends": [
+    "base-iouring-raw",
+    "tokio-task-raw"
+   ],
+   "distinct_addresses": 2,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "sweep",
+    "rate",
+    64,
+    200000
+   ],
+   "records": 2,
+   "backends": [
+    "base-iouring-raw",
+    "tokio-task-raw"
+   ],
+   "distinct_addresses": 2,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "sweep",
+    "rate",
+    64,
+    220000
+   ],
+   "records": 2,
+   "backends": [
+    "base-iouring-raw",
+    "tokio-task-raw"
+   ],
+   "distinct_addresses": 2,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  },
+  {
+   "group": [
+    "sweep",
+    "rate",
+    64,
+    240000
+   ],
+   "records": 2,
+   "backends": [
+    "base-iouring-raw",
+    "tokio-task-raw"
+   ],
+   "distinct_addresses": 2,
+   "distinct_parameters": 1,
+   "distinct_signatures": 1,
+   "workloads": [
+    "base-benchmark-load/http1"
+   ]
+  }
+ ],
+ "hyper_tokio_server_writes_vs_client_counts": []
+}

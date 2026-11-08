@@ -43,8 +43,9 @@ Validation (of every response):
 
 Output:
   --connection-details       Include every connection's counters in the record.
-  --busy-limit FRACTION      Flag the client as saturated when a worker is busy for more of the window [0.9].
-  --dispatch-lag-limit DURATION  Flag the client as saturated when the 99th percentile dispatch lag exceeds this.
+  --busy-limit FRACTION      Flag the client as saturated when a worker is busy for more of the window [0.8].
+  --schedule-lag-limit DURATION  In rate mode, flag the client as saturated when a worker's 99th percentile schedule lag exceeds this [50us].
+  --shortfall-limit FRACTION In rate mode, flag the client as saturated when more of the requests planned in the window were not sent in it [0.001].
   --fail-on CLASSES          Exit unsuccessfully, without a record, on invalid responses, errors, or saturation: a comma-separated list of invalid, errors, saturated.
   --quiet                    Do not write the summary to stderr.
 
@@ -113,7 +114,8 @@ pub struct Options {
     pub response: Option<Vec<u8>>,
     pub connection_details: bool,
     pub busy_limit: f64,
-    pub dispatch_lag_limit: Option<Duration>,
+    pub schedule_lag_limit: Duration,
+    pub shortfall_limit: f64,
     pub fail_on: FailOn,
     pub quiet: bool,
 }
@@ -127,7 +129,7 @@ pub enum Command {
 }
 
 /// The options that take a value.
-const VALUE_OPTIONS: [&str; 26] = [
+const VALUE_OPTIONS: [&str; 27] = [
     "--address",
     "--connections",
     "--depth",
@@ -152,9 +154,17 @@ const VALUE_OPTIONS: [&str; 26] = [
     "--expect-header",
     "--response-file",
     "--busy-limit",
-    "--dispatch-lag-limit",
+    "--schedule-lag-limit",
+    "--shortfall-limit",
     "--fail-on",
 ];
+
+/// The default `--busy-limit`. On the measuring host hana, one worker at 120,000 requests per second was busy for 76–77% of the window, with a 99th percentile latency 1.1 times the reference client's; at 140,000 it was busy for 86–88%, with a 99th percentile 1.3 times, and a 99.9th 2 to 3 times, the reference's. `results/2026-11-09-hana` records the evaluation.
+const DEFAULT_BUSY_LIMIT: f64 = 0.8;
+/// The default `--schedule-lag-limit`: twice the largest 99th percentile dispatch lag of hana's healthy runs, 24 µs, which equals the schedule lag when connections have room, as nearly all did. Disturbed runs on aiko had 105 µs to 10 ms.
+const DEFAULT_SCHEDULE_LAG_LIMIT: Duration = Duration::from_micros(50);
+/// The default `--shortfall-limit`: one in a thousand planned requests, a backlog growing by a millisecond each second. On hana, runs that kept up sent within 14 requests of their plan in the window, and runs whose median latency reached 5 ms or more fell 0.13% to 12% short.
+const DEFAULT_SHORTFALL_LIMIT: f64 = 0.001;
 
 /// The most reporting intervals a window may have; each needs a small histogram per worker.
 pub const INTERVAL_COUNT_LIMIT: u64 = 100_000;
@@ -187,8 +197,9 @@ impl Options {
             expect_headers: Vec::new(),
             response: None,
             connection_details: false,
-            busy_limit: 0.9,
-            dispatch_lag_limit: None,
+            busy_limit: DEFAULT_BUSY_LIMIT,
+            schedule_lag_limit: DEFAULT_SCHEDULE_LAG_LIMIT,
+            shortfall_limit: DEFAULT_SHORTFALL_LIMIT,
             fail_on: FailOn::default(),
             quiet: false,
         }
@@ -281,8 +292,11 @@ impl Options {
                 }
                 "--response-file" => read(&value).map(|bytes| options.response = Some(bytes)),
                 "--busy-limit" => fraction(&value).map(|fraction| options.busy_limit = fraction),
-                "--dispatch-lag-limit" => {
-                    duration(&value).map(|limit| options.dispatch_lag_limit = Some(limit))
+                "--schedule-lag-limit" => {
+                    duration(&value).map(|limit| options.schedule_lag_limit = limit)
+                }
+                "--shortfall-limit" => {
+                    fraction(&value).map(|fraction| options.shortfall_limit = fraction)
                 }
                 _ => fail_on(options.fail_on, &value).map(|fail_on| options.fail_on = fail_on),
             }?;

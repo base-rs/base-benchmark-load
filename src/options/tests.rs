@@ -91,8 +91,10 @@ fn every_option() {
         "--connection-details",
         "--busy-limit",
         "0.5",
-        "--dispatch-lag-limit",
-        "50µs",
+        "--schedule-lag-limit",
+        "75µs",
+        "--shortfall-limit",
+        "0.01",
         "--fail-on",
         "invalid,errors",
         "--fail-on",
@@ -135,7 +137,8 @@ fn every_option() {
     );
     assert!(options.connection_details && options.quiet);
     assert_eq!(options.busy_limit, 0.5);
-    assert_eq!(options.dispatch_lag_limit, Some(Duration::from_micros(50)));
+    assert_eq!(options.schedule_lag_limit, Duration::from_micros(75));
+    assert_eq!(options.shortfall_limit, 0.01);
     assert_eq!(
         options.fail_on,
         FailOn {

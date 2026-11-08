@@ -1,0 +1,36 @@
+{
+ "argv": [
+  "scripts/evaluate.py",
+  "closed",
+  "--output",
+  "out/closed",
+  "--backends",
+  "base-native",
+  "hyper-tokio",
+  "--clients",
+  "load",
+  "wrk",
+  "--connections",
+  "1",
+  "16",
+  "64",
+  "--repetitions",
+  "5",
+  "--warmup",
+  "2",
+  "--duration",
+  "8"
+ ],
+ "utc": 1794171028.7477565,
+ "uname": [
+  "Linux",
+  "hana",
+  "7.2.14-arch1-1",
+  "#1 SMP PREEMPT_DYNAMIC Fri, 30 Oct 2026 14:32:40 +0000",
+  "x86_64"
+ ],
+ "loadavg": "0.97 1.00 0.72 1/715 1258952\n",
+ "governors": [
+  "powersave"
+ ]
+}

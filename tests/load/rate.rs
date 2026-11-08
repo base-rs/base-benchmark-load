@@ -46,7 +46,13 @@ fn every_planned_request_is_validated_exactly_once() {
     let signature = format!("http1 status 200 body 13:{}", digest_of_hello());
     assert_eq!(record.signature.as_deref(), Some(signature.as_str()));
     // Every distribution counts the cohort, and quantiles are ordered.
-    for name in ["latency", "round_trip", "send_delay", "dispatch_lag"] {
+    for name in [
+        "latency",
+        "round_trip",
+        "send_delay",
+        "dispatch_lag",
+        "schedule_lag",
+    ] {
         assert_eq!(
             extension(&record)["histograms"][name]["count"],
             1000,
@@ -117,6 +123,47 @@ fn a_server_stall_stays_visible_in_open_loop_latency() {
     assert!(metric(&record, "latency_p99") >= 30.0 * MS);
     let intervals = extension(&record)["intervals"].as_array().unwrap();
     assert!(intervals[0]["latency_max_ns"].as_f64().unwrap() >= 40.0 * MS);
+}
+
+/// A run whose window ends with requests it planned in it still unsent did not offer its rate in the window, so the run is flagged as saturated, whichever side held the requests back. Here the server stalls the response to the request planned 150 ms into a 200 ms window for 100 ms, so the 49 requests planned after it on the one connection can only be sent after the window, however fast the client is.
+#[test]
+fn requests_planned_in_the_window_but_sent_after_it_are_a_shortfall() {
+    let server = Server::start(|arrival| match (arrival.connection, arrival.request) {
+        (1, 150) => Action::Delay(Duration::from_millis(100), HELLO.to_vec()),
+        _ => Action::Respond(HELLO.to_vec()),
+    });
+    let report = load(
+        "rate",
+        server.address,
+        &[
+            "--rate",
+            "1000",
+            "--connections",
+            "1",
+            "--warmup",
+            "0",
+            "--duration",
+            "200ms",
+        ],
+    )
+    .unwrap();
+    let record = record(&report);
+    assert_eq!(count(&record, "responses_valid"), 200);
+    assert!(report.shortfall() >= 49, "{}", report.shortfall());
+    assert_eq!(
+        count(&record, "sent_in_window_shortfall"),
+        report.shortfall()
+    );
+    assert_eq!(count(&record, "sent_in_window"), 200 - report.shortfall());
+    let reasons = report.saturation();
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("of the 200 requests planned in the window")),
+        "{reasons:?}"
+    );
+    assert_eq!(metric(&record, "client_saturated"), 1.0);
+    assert!(report.summary().contains("were not sent in it"));
 }
 
 /// With pipelining, requests sent behind the stalled one are on the wire and still wait for it.

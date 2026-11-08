@@ -16,6 +16,7 @@ use crate::{
 use base_benchmark::{Interval, Sample};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     thread::Builder,
@@ -135,7 +136,19 @@ fn sleep_until(clock: &MonotonicClock, instant: u64) {
     }
 }
 
-/// Control a run from the calling thread: start `workers` threads, each running `worker`, which reports its setup to the [`Start`] it is given; once all have set up, pin the calling thread to `controller_cpu`, if any, and start them together; measure the window with an [`Interval`]; and collect their results. Returns the start, the controller's sample, and each worker's result. Each worker's thread is spawned from the builder `prepare` returns, given its index, a builder that names it, and the start.
+/// What the controller measured of a run.
+#[derive(Debug)]
+struct Controlled {
+    /// The start.
+    origin: u64,
+    /// The controller's measurement of the window.
+    sample: Sample,
+    /// Each CPU's time in software interrupts over the controller's window, unless `/proc/stat` could not be read.
+    softirq: Option<BTreeMap<usize, u64>>,
+    results: Vec<WorkerResult>,
+}
+
+/// Control a run from the calling thread: start `workers` threads, each running `worker`, which reports its setup to the [`Start`] it is given; once all have set up, pin the calling thread to `controller_cpu`, if any, and start them together; measure the window with an [`Interval`], and each CPU's software interrupt time over it; and collect their results. Each worker's thread is spawned from the builder `prepare` returns, given its index, a builder that names it, and the start.
 ///
 /// Fails when a worker's thread cannot be spawned, as when the process may have no more threads or memory; when a worker fails to set up, including when it panics before it reports; or when the controller cannot pin its CPU. The workers that started are released and joined first, so a panic is reported as the error that names its worker.
 fn drive(
@@ -146,7 +159,7 @@ fn drive(
     clock: &MonotonicClock,
     worker: impl Fn(usize, &Start) -> Option<WorkerResult> + Sync,
     prepare: impl Fn(usize, Builder, &Start) -> io::Result<Builder>,
-) -> io::Result<(u64, Sample, Vec<WorkerResult>)> {
+) -> io::Result<Controlled> {
     let start = Start::new(workers);
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
@@ -190,6 +203,7 @@ fn drive(
         sleep_until(clock, origin.saturating_add(warmup));
         // The controller's interval approximates the window, which the workers time exactly: it starts and ends when this thread wakes, a little after each boundary.
         let interval = Interval::start().expect("measuring the current process succeeds");
+        let softirq_start = os::softirq_times().ok();
         sleep_until(
             clock,
             origin.saturating_add(warmup).saturating_add(duration),
@@ -197,6 +211,18 @@ fn drive(
         let sample = interval
             .finish(1)
             .expect("measuring the current process succeeds");
+        let softirq = softirq_start
+            .zip(os::softirq_times().ok())
+            .map(|(start, end)| {
+                end.into_iter()
+                    .map(|(cpu, time)| {
+                        (
+                            cpu,
+                            time.saturating_sub(start.get(&cpu).copied().unwrap_or(time)),
+                        )
+                    })
+                    .collect()
+            });
         let results = handles
             .into_iter()
             .map(|handle| {
@@ -206,7 +232,12 @@ fn drive(
                     .expect("started workers return their results")
             })
             .collect();
-        Ok((origin, sample, results))
+        Ok(Controlled {
+            origin,
+            sample,
+            softirq,
+            results,
+        })
     })
 }
 
@@ -270,7 +301,12 @@ pub fn run(options: &Options) -> io::Result<Report> {
         expectation: &expectation,
     };
     let clock = MonotonicClock::new();
-    let (origin, sample, results) = drive(
+    let Controlled {
+        origin,
+        sample,
+        softirq,
+        results,
+    } = drive(
         load.workers,
         options.controller_cpu,
         load.warmup,
@@ -282,11 +318,16 @@ pub fn run(options: &Options) -> io::Result<Report> {
     let workers: Vec<WorkerReport> = results
         .into_iter()
         .enumerate()
-        .map(|(index, result)| WorkerReport {
-            cpu: options.cpus.get(index).copied(),
-            affinity: result.affinity,
-            statistics: result.statistics,
-            connections: result.connections,
+        .map(|(index, result)| {
+            let cpu = options.cpus.get(index).copied();
+            WorkerReport {
+                cpu,
+                affinity: result.affinity,
+                statistics: result.statistics,
+                connections: result.connections,
+                softirq: cpu
+                    .and_then(|cpu| softirq.as_ref().and_then(|times| times.get(&cpu).copied())),
+            }
         })
         .collect();
     let settings = load.settings(origin);
@@ -302,7 +343,8 @@ pub fn run(options: &Options) -> io::Result<Report> {
         window_end: settings.timing.window_end,
         interval: load.interval,
         busy_limit: options.busy_limit,
-        dispatch_lag_limit: options.dispatch_lag_limit.map(nanoseconds),
+        schedule_lag_limit: nanoseconds(options.schedule_lag_limit),
+        shortfall_limit: options.shortfall_limit,
         connection_details: options.connection_details,
         preflight_requests: PREFLIGHT_REQUESTS,
         context: json!({

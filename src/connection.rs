@@ -187,10 +187,13 @@ impl<T: Read + Write> Connection<T> {
         Ok(())
     }
 
-    /// Read until the socket would block, completing every response that arrives. An error ends the connection: the caller charges it to the outstanding requests with [`Connection::fail`].
+    /// Read what the socket holds, completing every response that arrives. An error ends the connection: the caller charges it to the outstanding requests with [`Connection::fail`].
+    ///
+    /// The socket is registered edge-triggered, so it must be read until nothing is left, but a read that returns less than the buffer offered has already found the socket empty, and the next read would only fail with `EWOULDBLOCK`: one wasted `recvfrom` per response. It is skipped. A TCP read returns less than it was offered only once it has taken everything queued, including what arrived while the read held the socket, which is queued as the read releases it. Whatever arrives after that wakes the socket's waiters again, which gives an edge-triggered registration a new event. When the event reported the peer's close or an error (`closed`), the close may have arrived with the data the read returns, before the event was reported, and then no later event reports it, so reading continues until the read reports the end of the stream, the error, or that it would block.
     pub fn readable(
         &mut self,
         clock: &impl Clock,
+        closed: bool,
         settings: &Settings,
         statistics: &mut WorkerStatistics,
     ) -> Result<(), ErrorKind> {
@@ -202,6 +205,7 @@ impl<T: Read + Write> Connection<T> {
                 .stream
                 .as_mut()
                 .expect("only connected streams are read");
+            let offered = self.input.len() - self.end;
             match stream.read(&mut self.input[self.end..]) {
                 Ok(0) => return Err(self.end_of_stream(clock.now(), settings, statistics)),
                 Ok(read) => {
@@ -209,6 +213,9 @@ impl<T: Read + Write> Connection<T> {
                     statistics.bytes_read += read as u64;
                     self.counters.bytes_read += read as u64;
                     self.process(clock.now(), settings, statistics)?;
+                    if read < offered && !closed {
+                        return Ok(());
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
