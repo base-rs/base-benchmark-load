@@ -134,6 +134,8 @@ pub struct Report {
     pub(crate) busy_limit: f64,
     pub(crate) dispatch_lag_limit: Option<u64>,
     pub(crate) connection_details: bool,
+    /// The requests sent before the load, which have no outcome in the record.
+    pub(crate) preflight_requests: u64,
     pub(crate) context: Value,
 }
 
@@ -448,6 +450,7 @@ impl Report {
         let mut extension = json!({
             "context": self.context,
             "planned": (self.mode == Mode::Rate).then_some(self.planned),
+            "preflight_requests": self.preflight_requests,
             "periods": periods,
             "connections": {
                 "connects": self.total.connects,

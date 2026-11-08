@@ -23,8 +23,10 @@ use std::{
 
 /// How far ahead of the moment every worker is connected the run starts, so that every worker sees the start before it arrives.
 const START_LEAD: u64 = 100_000_000;
-/// Descriptors needed beyond one per connection: standard streams, epoll instances, and the preflight connection.
+/// Descriptors needed beyond one per connection and one epoll instance per worker: the standard streams, the preflight connection, and whatever else the process holds, with room to spare.
 const DESCRIPTOR_ALLOWANCE: u64 = 64;
+/// The requests sent before the load, on a connection of their own: one preflight request. A server's own request count exceeds the record's outcomes by this many.
+pub const PREFLIGHT_REQUESTS: u64 = 1;
 
 /// Send one request on its own connection and validate the response, before any load, waiting at most `timeout` to connect and as long again between reads. Its body is captured, to become the expected body unless the options give one.
 pub fn preflight(
@@ -137,7 +139,9 @@ pub fn run(options: &Options) -> io::Result<Report> {
     if options.body == BodyExpectation::Preflight && options.response.is_none() {
         expectation.body = preflight.body;
     }
-    os::raise_descriptor_limit(options.connections as u64 + DESCRIPTOR_ALLOWANCE);
+    let descriptor_limit = os::raise_descriptor_limit(
+        options.connections as u64 + options.workers as u64 + DESCRIPTOR_ALLOWANCE,
+    );
     let load = Load {
         address,
         connections: options.connections,
@@ -225,6 +229,7 @@ pub fn run(options: &Options) -> io::Result<Report> {
         busy_limit: options.busy_limit,
         dispatch_lag_limit: options.dispatch_lag_limit.map(nanoseconds),
         connection_details: options.connection_details,
+        preflight_requests: PREFLIGHT_REQUESTS,
         context: json!({
             "version": env!("CARGO_PKG_VERSION"),
             "debug_assertions": cfg!(debug_assertions),
@@ -232,6 +237,7 @@ pub fn run(options: &Options) -> io::Result<Report> {
             "address": address.to_string(),
             "cpus": options.cpus,
             "controller_cpu": options.controller_cpu,
+            "descriptor_limit": descriptor_limit,
         }),
     })
 }

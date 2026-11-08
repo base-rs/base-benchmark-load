@@ -50,6 +50,7 @@ fn report(
         busy_limit: 0.9,
         dispatch_lag_limit: None,
         connection_details: false,
+        preflight_requests: 1,
         context: json!({"version": "test"}),
     }
 }
@@ -185,6 +186,7 @@ fn open_loop_records() {
     assert_eq!(extension["planned"], 10);
     assert_eq!(extension["workers"][1]["cpu"], 3);
     assert_eq!(extension["workers"][1]["affinity"], json!([3]));
+    assert_eq!(extension["preflight_requests"], 1);
     assert_eq!(extension["intervals"][0]["latency_count"], 8);
     assert_eq!(extension["intervals"][1]["offset_ns"], 5 * MS);
     assert_eq!(extension["fairness"]["connection_completions"]["zero"], 2);

@@ -53,18 +53,19 @@ pub fn thread_cpu_time() -> u64 {
     time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
 }
 
-/// Raise the soft limit on open descriptors to at least `needed`, up to the hard limit. Returns the soft limit in effect.
+/// Raise the soft limit on open descriptors to at least `needed`, up to the hard limit. Returns the soft limit in effect afterwards, read back from the kernel, which may be below `needed`.
 pub fn raise_descriptor_limit(needed: u64) -> u64 {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    // SAFETY: `limit` is valid for reads and writes. Both calls fail only for an invalid resource or pointer, or a soft limit above the hard limit, which `min` prevents.
+    // SAFETY: `limit` is valid for reads and writes. `getrlimit` fails only for an invalid resource or pointer. If `setrlimit` fails, the limit is unchanged, and reading it back reports that.
     unsafe {
         libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
         if limit.rlim_cur < needed {
             limit.rlim_cur = needed.min(limit.rlim_max);
             libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
         }
     }
     limit.rlim_cur
