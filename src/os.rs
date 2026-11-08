@@ -147,14 +147,12 @@ pub fn clock_source() -> Option<String> {
 #[cfg(test)]
 /// A loopback address that refuses connections: a socket bound to a free port that never listens, which also keeps the port from being reused while it lives.
 pub fn refusing() -> (OwnedFd, SocketAddr) {
-    // SAFETY: `socket` returns a new descriptor, owned by nothing else, which is checked below.
-    let socket = unsafe {
-        OwnedFd::from_raw_fd(libc::socket(
-            libc::AF_INET,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-        ))
-    };
+    // SAFETY: `socket` returns a new descriptor or -1.
+    let descriptor =
+        result(unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) })
+            .expect("creating a socket succeeds");
+    // SAFETY: A new descriptor is owned by nothing else.
+    let socket = unsafe { OwnedFd::from_raw_fd(descriptor) };
     let mut inet = libc::sockaddr_in {
         sin_family: libc::AF_INET as libc::sa_family_t,
         sin_port: 0,
