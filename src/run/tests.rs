@@ -2,6 +2,7 @@
 // Copyright, 2026, by Samuel Williams.
 
 use super::*;
+use crate::clock::StepClock;
 
 fn expectation(body: Option<&[u8]>, response: Option<&[u8]>) -> Expectation {
     Expectation {
@@ -79,33 +80,112 @@ fn parameters_describe_the_work() {
     );
 }
 
-/// A reader that is interrupted by a signal before every chunk it returns.
+/// A reader that is interrupted by a signal `interruptions` times before every chunk it returns, and records the read timeouts it is given.
 struct Interrupted<'a> {
     chunks: std::collections::VecDeque<&'a [u8]>,
-    interrupt: bool,
+    interruptions: usize,
+    interrupted: usize,
+    timeouts: std::cell::RefCell<Vec<Duration>>,
+    /// Whether setting a timeout fails.
+    refuse_timeouts: bool,
+}
+
+impl<'a> Interrupted<'a> {
+    fn new(chunks: &[&'a [u8]], interruptions: usize) -> Self {
+        Self {
+            chunks: chunks.iter().copied().collect(),
+            interruptions,
+            interrupted: 0,
+            timeouts: Vec::new().into(),
+            refuse_timeouts: false,
+        }
+    }
 }
 
 impl Read for Interrupted<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.interrupt = !self.interrupt;
-        if self.interrupt {
+        if self.interrupted < self.interruptions {
+            self.interrupted += 1;
             return Err(io::ErrorKind::Interrupted.into());
         }
+        self.interrupted = 0;
         let chunk = self.chunks.pop_front().unwrap_or_default();
         buffer[..chunk.len()].copy_from_slice(chunk);
         Ok(chunk.len())
     }
 }
 
+impl TimedRead for &mut Interrupted<'_> {
+    fn set_read_timeout(&self, timeout: Duration) -> io::Result<()> {
+        if self.refuse_timeouts {
+            return Err(io::Error::other("no timeouts"));
+        }
+        self.timeouts.borrow_mut().push(timeout);
+        Ok(())
+    }
+}
+
 #[test]
 fn preflight_reads_are_retried_when_interrupted() {
     let request = RequestTemplate::new("GET", "/", "host", &[], b"");
-    let reader = Interrupted {
-        chunks: [&b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no"[..], b"k"].into(),
-        interrupt: false,
-    };
-    let response = read_response(reader, &request, &expectation(None, None)).unwrap();
+    let mut reader = Interrupted::new(
+        &[&b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no"[..], b"k"],
+        1,
+    );
+    // Each clock read advances 1 µs: an interrupted read is retried with what remains of its timeout, and a read that returns data starts the next one's afresh.
+    let clock = StepClock::new(0, 1_000);
+    let response = read_response(
+        &mut reader,
+        10_000,
+        &clock,
+        &request,
+        &expectation(None, None),
+    )
+    .unwrap();
     assert_eq!(response.body.as_deref(), Some(&b"ok"[..]));
+    assert_eq!(
+        *reader.timeouts.borrow(),
+        [10, 9, 10, 9].map(Duration::from_micros)
+    );
+}
+
+/// A signal arriving faster than the read timeout interrupts every read, and the read still times out once its whole timeout has passed.
+#[test]
+fn preflight_reads_time_out_however_often_they_are_interrupted() {
+    let request = RequestTemplate::new("GET", "/", "host", &[], b"");
+    let mut reader = Interrupted::new(&[], usize::MAX);
+    let clock = StepClock::new(0, 1_000);
+    let error = read_response(
+        &mut reader,
+        3_000,
+        &clock,
+        &request,
+        &expectation(None, None),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(error.to_string(), "the server sent nothing more in time");
+    assert_eq!(
+        *reader.timeouts.borrow(),
+        [3, 2, 1].map(Duration::from_micros)
+    );
+}
+
+#[test]
+fn preflight_reads_fail_when_their_timeout_cannot_be_set() {
+    let request = RequestTemplate::new("GET", "/", "host", &[], b"");
+    let mut reader = Interrupted::new(&[], 0);
+    reader.refuse_timeouts = true;
+    let clock = StepClock::new(0, 1_000);
+    let error = read_response(
+        &mut reader,
+        3_000,
+        &clock,
+        &request,
+        &expectation(None, None),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "no timeouts");
 }
 
 #[test]

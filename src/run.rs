@@ -36,9 +36,16 @@ pub fn preflight(
     timeout: Duration,
 ) -> io::Result<Response> {
     TcpStream::connect_timeout(&address, timeout)
-        .and_then(|stream| stream.set_read_timeout(Some(timeout)).map(|()| stream))
         .and_then(|mut stream| stream.write_all(&request.bytes).map(|()| stream))
-        .and_then(|stream| read_response(stream, request, expectation))
+        .and_then(|stream| {
+            read_response(
+                stream,
+                nanoseconds(timeout),
+                &MonotonicClock::new(),
+                request,
+                expectation,
+            )
+        })
         .map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -47,20 +54,47 @@ pub fn preflight(
         })
 }
 
-/// Read the preflight response. A read interrupted by a signal is retried: with a read timeout set, Linux never restarts it, whatever the signal's disposition.
+/// A stream whose reads wait at most a timeout.
+trait TimedRead: Read {
+    fn set_read_timeout(&self, timeout: Duration) -> io::Result<()>;
+}
+
+impl TimedRead for TcpStream {
+    fn set_read_timeout(&self, timeout: Duration) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, Some(timeout))
+    }
+}
+
+/// Read the preflight response, waiting at most `timeout` nanoseconds of `clock` for each read to return data. A read interrupted by a signal is retried, since with a read timeout set Linux never restarts it, whatever the signal's disposition; the retry waits only for what remains of the read's timeout, so frequent signals, such as a profiler's timer, cannot prolong the wait.
 fn read_response(
-    mut stream: impl Read,
+    mut stream: impl TimedRead,
+    timeout: u64,
+    clock: &impl Clock,
     request: &RequestTemplate,
     expectation: &Expectation,
 ) -> io::Result<Response> {
     let mut parser = ResponseParser::capturing();
     let mut buffer = Vec::new();
     let mut chunk = [0; 16 * 1024];
+    // When the current read times out; none until it starts.
+    let mut deadline = None;
     loop {
+        let now = clock.now();
+        let remaining = deadline
+            .get_or_insert(now.saturating_add(timeout))
+            .saturating_sub(now);
+        if remaining == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the server sent nothing more in time",
+            ));
+        }
+        stream.set_read_timeout(Duration::from_nanos(remaining))?;
         let read = match stream.read(&mut chunk) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             read => read?,
         };
+        deadline = None;
         if read == 0 {
             return parser.at_eof(expectation).ok_or(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
