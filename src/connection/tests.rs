@@ -393,21 +393,31 @@ fn a_closing_response_ends_the_connection_after_it_completes() {
 #[test]
 fn close_delimited_responses_complete_at_the_end_of_the_stream() {
     let fixture = Fixture::new();
-    let settings = fixture.rate(1, 1);
+    // At depth 2, a second request is pipelined behind the close-delimited response, which ends it as a closing response would.
+    let settings = fixture.rate(1, 2);
     let (mut connection, mut statistics) = open_measured(
         &settings,
         script([&b"HTTP/1.1 200 OK\r\n\r\no"[..], b"k", b""]),
     );
-    connection.dispatch(START + 3 * MS, 12, &settings, &mut statistics);
     assert_eq!(
-        connection.readable(
-            &StepClock::new(START + 4 * MS, 0),
-            &settings,
-            &mut statistics
-        ),
-        Err(ErrorKind::Eof)
+        connection.dispatch(START + 3 * MS, 12, &settings, &mut statistics),
+        2
     );
-    assert_eq!(statistics.period(Period::Measured).valid, 1);
+    let now = START + 4 * MS;
+    let kind = connection
+        .readable(&StepClock::new(now, 0), &settings, &mut statistics)
+        .unwrap_err();
+    assert_eq!(kind, ErrorKind::Closed);
+    connection.fail(kind, now, &settings, &mut statistics);
+    let measured = statistics.period(Period::Measured);
+    assert_eq!(
+        (
+            measured.valid,
+            measured.errors[ErrorKind::Closed as usize],
+            measured.errors[ErrorKind::Eof as usize]
+        ),
+        (1, 1, 0)
+    );
     assert_eq!(statistics.idle_closes, 0);
 }
 

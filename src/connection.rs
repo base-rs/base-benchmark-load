@@ -284,7 +284,7 @@ impl<T: Read + Write> Connection<T> {
         );
     }
 
-    /// The server closed the connection: complete a response delimited by the close, then report the end of the stream.
+    /// The server closed the connection: complete a response delimited by the close, then report the end of the stream. Requests pipelined behind a close-delimited response were ended by a response that closes, as behind `Connection: close`; otherwise the server closed before their responses were complete.
     fn end_of_stream(
         &mut self,
         now: u64,
@@ -294,10 +294,13 @@ impl<T: Read + Write> Connection<T> {
         if self.in_flight.is_empty() && self.start == self.end {
             statistics.idle_closes += 1;
         }
-        if let Some(response) = self.parser.at_eof(settings.expectation) {
-            self.complete(now, response, settings, statistics);
+        match self.parser.at_eof(settings.expectation) {
+            Some(response) => {
+                self.complete(now, response, settings, statistics);
+                ErrorKind::Closed
+            }
+            None => ErrorKind::Eof,
         }
-        ErrorKind::Eof
     }
 
     /// Whether the oldest outstanding request has waited for its response longer than the timeout.

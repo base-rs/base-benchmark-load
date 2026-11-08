@@ -130,7 +130,7 @@ fn close_delimited_bodies_complete_at_eof() {
     for input in [
         &b"HTTP/1.1 200 OK\r\n\r\nuntil close"[..],
         // A final coding other than chunked is delimited by the close too.
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nContent-Length: 2\r\n\r\nuntil close",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nuntil close",
     ] {
         let mut parser = ResponseParser::default();
         assert_eq!(parser.at_eof(&expectation), None);
@@ -144,7 +144,7 @@ fn close_delimited_bodies_complete_at_eof() {
 
 #[test]
 fn transfer_encoding_takes_the_last_coding_of_every_header() {
-    let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: , CHUNKED \r\nContent-Length: 99\r\n\r\n2\r\nok\r\n0\r\n\r\n";
+    let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: , CHUNKED \r\n\r\n2\r\nok\r\n0\r\n\r\n";
     let (responses, _) = parse_all(input, &expect(Some(b"ok")), false).unwrap();
     assert_eq!(responses, [valid(2)]);
     let input =
@@ -162,17 +162,44 @@ fn content_lengths_must_agree_and_be_decimal() {
         parse_all(input, &expect(Some(b"ok")), false).unwrap().0,
         [valid(2)]
     );
-    for header in ["2, 3", "+2", "0x2", "", "99999999999999999999"] {
+    // An empty value names no length, so it is an error rather than leaving the body to be delimited by the close.
+    for header in ["2, 3", "+2", "0x2", "", " , ", "99999999999999999999"] {
         let input =
             format!("HTTP/1.1 200 OK\r\nContent-Length: {header}\r\nContent-Length: 2\r\n\r\nok");
         let result = parse_all(input.as_bytes(), &expect(None), false);
-        if header.is_empty() {
-            // An empty value names no length.
-            assert!(result.is_ok());
-        } else {
-            assert_eq!(result.unwrap_err(), ParseError::ContentLength, "{header}");
+        assert_eq!(result.unwrap_err(), ParseError::ContentLength, "{header:?}");
+    }
+    let alone = b"HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\nok";
+    assert_eq!(
+        parse_all(alone, &expect(None), false).unwrap_err(),
+        ParseError::ContentLength
+    );
+}
+
+/// RFC 9112 section 6.3: a message with both `Transfer-Encoding` and `Content-Length` ought to be handled as an error, whatever the codings, since the two framings may disagree.
+#[test]
+fn transfer_encoding_with_content_length_is_a_parse_error() {
+    for coding in ["chunked", "gzip", ""] {
+        for (first, second) in [
+            (format!("Transfer-Encoding: {coding}"), "Content-Length: 2"),
+            (
+                "Content-Length: 2".to_owned(),
+                &*format!("Transfer-Encoding: {coding}"),
+            ),
+        ] {
+            let input =
+                format!("HTTP/1.1 200 OK\r\n{first}\r\n{second}\r\n\r\n2\r\nok\r\n0\r\n\r\n");
+            assert_eq!(
+                parse_all(input.as_bytes(), &expect(None), false).unwrap_err(),
+                ParseError::TransferEncodingWithContentLength,
+                "{input:?}"
+            );
         }
     }
+    // Responses without a body are not framed by either field.
+    let input =
+        b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n";
+    assert!(parse_all(input, &expect(None), false).is_ok());
 }
 
 #[test]

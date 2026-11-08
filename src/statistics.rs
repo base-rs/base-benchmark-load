@@ -21,7 +21,7 @@ pub enum ErrorKind {
     Timeout,
     /// The response could not be framed: a malformed head, an oversized head, invalid lengths or chunks, an unsupported protocol switch, or bytes that no request asked for.
     Parse,
-    /// An earlier response on the connection said `Connection: close`, ending the connection before this request's response.
+    /// An earlier response on the connection closed it, ending the connection before this request's response: it said `Connection: close`, or its body was delimited by the close.
     Closed,
     /// The request was planned but never sent before the drain deadline (open loop only).
     Unsent,

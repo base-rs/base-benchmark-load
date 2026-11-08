@@ -3,14 +3,17 @@
 
 //! HTTP/1.1 response framing and validation.
 //!
-//! Heads are parsed by `httparse`; bodies are framed here, following RFC 9112 section 6.3: no body for `HEAD` requests and `204` or `304` responses, chunked transfer coding when it is the final coding, any other transfer coding or no length delimited by the connection closing, and otherwise `Content-Length`. This framing is deliberately independent of Base's own HTTP implementation, so that a framing bug shared by client and server cannot hide itself.
+//! Heads are parsed by `httparse`; bodies are framed here, following RFC 9112 section 6.3: no body for `HEAD` requests and `204` or `304` responses, chunked transfer coding when it is the final coding, any other transfer coding or no length delimited by the connection closing, and otherwise `Content-Length`. A response with both `Transfer-Encoding` and `Content-Length`, which the RFC says ought to be handled as an error, or with an invalid or empty `Content-Length`, cannot be framed. This framing is deliberately independent of Base's own HTTP implementation, so that a framing bug shared by client and server cannot hide itself.
+//!
+//! The limits below bound what one connection buffers. Each is far beyond what a benchmarked server sends, so reaching one means the bytes are not the response they claim to be; they are parse errors rather than growth without bound.
 
 use crate::statistics::InvalidKind;
 
-/// The largest response head accepted. A longer head is a parse error, which bounds the receive buffer.
+/// The largest response head accepted. The receive buffer grows only to hold one incomplete head, so this bounds it, for each of thousands of connections. Servers send heads of hundreds of bytes; a head that has not ended within 64 KiB is a parse error.
 pub const HEAD_SIZE_LIMIT: usize = 64 * 1024;
+/// The most header fields accepted in one head, as in hyper's default. `httparse` parses into a fixed array of this many slots on the stack, for every head; more is a parse error.
 const HEADER_COUNT_LIMIT: usize = 100;
-/// The longest chunk-size or trailer line accepted.
+/// The longest chunk-size or trailer line accepted, which bounds how much of an incomplete line is buffered and searched for its end. A chunk size has at most 16 hexadecimal digits, which leaves room for extensions and trailers.
 const LINE_LENGTH_LIMIT: usize = 4096;
 
 /// What a valid response must contain.
@@ -30,7 +33,10 @@ pub struct Expectation {
 pub enum ParseError {
     Head,
     HeadSizeLimit,
+    /// A `Content-Length` that is empty, not decimal, too long, or disagrees with another.
     ContentLength,
+    /// Both `Transfer-Encoding` and `Content-Length`, which RFC 9112 section 6.3 says ought to be handled as an error, since the two framings may disagree.
+    TransferEncodingWithContentLength,
     ChunkSize,
     ChunkTerminator,
     LineLengthLimit,
@@ -323,20 +329,32 @@ fn framing(
     if head_request || status == 204 || status == 304 {
         return Ok(Stage::Length(0));
     }
+    let mut transfer_encoding = false;
     let mut coding = None;
     let mut length = None;
     for header in head.headers.iter() {
         if header.name.eq_ignore_ascii_case("transfer-encoding") {
+            // An empty list of codings is allowed, but the field is still present.
+            transfer_encoding = true;
             coding = tokens(header.value).last().or(coding);
         } else if header.name.eq_ignore_ascii_case("content-length") {
+            let mut values = 0;
             for token in tokens(header.value) {
                 let value = decimal(token).ok_or(ParseError::ContentLength)?;
                 if length.is_some_and(|length| length != value) {
                     return Err(ParseError::ContentLength);
                 }
                 length = Some(value);
+                values += 1;
+            }
+            // A field without a value names no length, rather than leaving the body to be delimited by the close.
+            if values == 0 {
+                return Err(ParseError::ContentLength);
             }
         }
+    }
+    if transfer_encoding && length.is_some() {
+        return Err(ParseError::TransferEncodingWithContentLength);
     }
     Ok(match (coding, length) {
         (Some(coding), _) if coding.eq_ignore_ascii_case(b"chunked") => Stage::ChunkSize,
