@@ -89,19 +89,14 @@ fn request_bodies_and_headers_are_sent() {
 
 #[test]
 fn required_headers_and_statuses_are_validated() {
+    // Of the 50 requests on the one connection, every third is answered validly, the next with another content type, and the next with another status.
     let server = Server::start(|arrival| {
-        Action::Respond(if arrival.connection == 0 {
-            HELLO.to_vec()
-        } else if arrival.request % 2 == 0 {
-            String::from_utf8(HELLO.to_vec())
-                .unwrap()
-                .replace("text/plain", "text/html")
-                .into_bytes()
-        } else {
-            String::from_utf8(HELLO.to_vec())
-                .unwrap()
-                .replace("200 OK", "503 Unavailable")
-                .into_bytes()
+        let hello = String::from_utf8(HELLO.to_vec()).unwrap();
+        Action::Respond(match arrival.request % 3 {
+            _ if arrival.connection == 0 => HELLO.to_vec(),
+            0 => HELLO.to_vec(),
+            1 => hello.replace("text/plain", "text/html").into_bytes(),
+            _ => hello.replace("200 OK", "503 Unavailable").into_bytes(),
         })
     });
     let record = rate(
@@ -113,8 +108,9 @@ fn required_headers_and_statuses_are_validated() {
             "content-type: text/plain",
         ],
     );
-    assert_eq!(count(&record, "invalid_header"), 25);
-    assert_eq!(count(&record, "invalid_status"), 25);
+    assert_eq!(count(&record, "responses_valid"), 17);
+    assert_eq!(count(&record, "invalid_header"), 17);
+    assert_eq!(count(&record, "invalid_status"), 16);
     assert_eq!(
         record.parameters["validation"]["headers"][0][0],
         "content-type"

@@ -166,3 +166,42 @@ fn closed_loops_without_a_valid_response_fail() {
     assert!(!output.status.success());
     assert!(text(&output.stderr).contains("no valid response completed in the measured window"));
 }
+
+#[test]
+fn rate_loops_without_a_valid_response_fail() {
+    // Operations are successes only, so a cohort that failed entirely has none, and no record.
+    let server = Server::start(|arrival| {
+        if arrival.connection == 0 {
+            Action::Respond(HELLO.to_vec())
+        } else {
+            Action::Close
+        }
+    });
+    let address = server.address.to_string();
+    let output = command(&[
+        "rate",
+        "--address",
+        &address,
+        "--rate",
+        "1000",
+        "--connections",
+        "2",
+        "--warmup",
+        "0",
+        "--duration",
+        "20ms",
+    ]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("measured cohort: 20 planned; 0 valid, 0 invalid, 20 failed"),
+        "the summary is still written: {stderr}"
+    );
+    assert!(
+        stderr.ends_with(
+            "base-benchmark-load: no valid response to a request planned in the measured window\n"
+        ),
+        "{stderr}"
+    );
+}

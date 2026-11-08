@@ -13,7 +13,7 @@ mod server;
 mod setup;
 
 use base_benchmark::{Measurement, ProcessRecord};
-use base_benchmark_load::{Command, Options, Report, run};
+use base_benchmark_load::{Command, ErrorKind, Options, Outcomes, Period, Report, run};
 use serde_json::Value;
 
 pub const MS: f64 = 1_000_000.0;
@@ -75,4 +75,22 @@ pub fn outcomes(record: &ProcessRecord, period: &str) -> u64 {
             .sum::<u64>()
     };
     period["valid"].as_u64().unwrap() + sum(&period["invalid"]) + sum(&period["errors"])
+}
+
+/// The outcomes of a report's measured period, for runs that have no record because none was valid.
+pub fn measured(report: &Report) -> Outcomes {
+    *report.statistics().period(Period::Measured)
+}
+
+pub fn errors(outcomes: &Outcomes, kind: ErrorKind) -> u64 {
+    outcomes.errors[kind as usize]
+}
+
+/// The requests a server received for a record: every outcome, and the preflight requests, which have none.
+pub fn requests(record: &ProcessRecord) -> u64 {
+    let preflight = extension(record)["preflight_requests"].as_u64().unwrap();
+    preflight
+        + outcomes(record, "warmup")
+        + outcomes(record, "measured")
+        + outcomes(record, "drain")
 }

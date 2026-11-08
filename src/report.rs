@@ -144,12 +144,9 @@ impl Report {
         &self.total
     }
 
-    /// The measured operations: every request planned in the window in the open loop, whatever its outcome, and the valid responses completed in the window in the closed loop.
+    /// The measured operations, which are successful requests only, as `base-benchmark` requires of a driver: the valid responses to requests planned in the window in the open loop, and the valid responses completed in the window in the closed loop. Planned, invalid, and failed requests are counted apart.
     pub fn operations(&self) -> u64 {
-        match self.mode {
-            Mode::Rate => self.planned,
-            Mode::Closed => self.total.period(Period::Measured).valid,
-        }
+        self.total.period(Period::Measured).valid
     }
 
     /// The fraction of the window each worker spent in iterations that did work.
@@ -239,13 +236,18 @@ impl Report {
 
     /// The `base-benchmark` process record, with one sample over the measured window.
     ///
-    /// Fails when there are no operations to normalize by: a closed-loop run without a single valid response in the window.
+    /// Totals of the measured phase are divided by the operations in `base-benchmark` summaries, and only properties of the server have a direction: diagnostics of the client, such as its busy time and saturation, are neutral, since a faster server makes the client busier.
+    ///
+    /// Fails when there are no operations to normalize by: a run without a single valid response in the measured period.
     pub fn record(&self) -> io::Result<ProcessRecord> {
         let operations = self.operations();
         if operations == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "no valid response completed in the measured window",
+                match self.mode {
+                    Mode::Rate => "no valid response to a request planned in the measured window",
+                    Mode::Closed => "no valid response completed in the measured window",
+                },
             ));
         }
         let mut sample = self.sample.clone();
@@ -253,6 +255,9 @@ impl Report {
         let measured = self.total.period(Period::Measured);
         let count = |name: &str, value: u64| Metric::total(name, Unit::Count, value);
         sample.push(count("responses_valid", measured.valid));
+        if self.mode == Mode::Rate {
+            sample.push(count("requests_planned", self.planned));
+        }
         sample.push(count("responses_invalid", measured.invalid_total()).lower_is_better());
         for kind in InvalidKind::ALL {
             sample.push(
@@ -278,31 +283,28 @@ impl Report {
                 .with_phase(Phase::Process)
                 .lower_is_better(),
         );
-        sample
-            .push(count("completed_in_window", self.total.completed_in_window).higher_is_better());
+        // Per operation, these are the completions and sends per valid response, which describe the run rather than rank servers; throughput is the inverse of `wall_time` per operation.
+        sample.push(count("completed_in_window", self.total.completed_in_window));
         sample.push(count("sent_in_window", self.total.sent_in_window));
+        // Every valid response of the measured period is in every distribution, so none is empty.
+        const NONEMPTY: &str = "a record has valid responses, which every distribution holds";
         for (name, histogram) in self.distributions() {
             for (suffix, quantile) in QUANTILES {
-                let name = format!("{name}_{suffix}");
-                sample.push(match histogram.value_at_quantile(quantile) {
-                    Some(value) => {
-                        Metric::quantile(name, Unit::Nanoseconds, quantile, value as f64)
-                            .lower_is_better()
-                    }
-                    None => Metric::unavailable(
-                        name,
+                let value = histogram.value_at_quantile(quantile).expect(NONEMPTY);
+                sample.push(
+                    Metric::quantile(
+                        format!("{name}_{suffix}"),
                         Unit::Nanoseconds,
-                        "no valid response in the window",
-                    ),
-                });
+                        quantile,
+                        value as f64,
+                    )
+                    .lower_is_better(),
+                );
             }
-            let name = format!("{name}_mean");
-            sample.push(match histogram.mean() {
-                Some(mean) => Metric::mean(name, Unit::Nanoseconds, mean).lower_is_better(),
-                None => {
-                    Metric::unavailable(name, Unit::Nanoseconds, "no valid response in the window")
-                }
-            });
+            let mean = histogram.mean().expect(NONEMPTY);
+            sample.push(
+                Metric::mean(format!("{name}_mean"), Unit::Nanoseconds, mean).lower_is_better(),
+            );
         }
         let drain = self
             .total
@@ -311,24 +313,23 @@ impl Report {
         sample.push(
             Metric::mean("drain_time", Unit::Nanoseconds, drain as f64).with_phase(Phase::Attached),
         );
-        sample.push(
-            Metric::mean(
-                "client_saturated",
-                Unit::Count,
-                f64::from(!self.saturation().is_empty() as u8),
-            )
-            .lower_is_better(),
-        );
+        // The client's saturation and busy time qualify the measurement rather than the server: in the closed loop, a faster server makes the client busier. They are neutral, so summaries report them without ranking subjects by them.
+        sample.push(Metric::mean(
+            "client_saturated",
+            Unit::Count,
+            f64::from(!self.saturation().is_empty() as u8),
+        ));
         let busiest = self
             .workers
             .iter()
             .map(|worker| worker.statistics.busy)
             .max()
-            .unwrap_or(0);
-        sample.push(
-            Metric::mean("worker_busy_time_max", Unit::Nanoseconds, busiest as f64)
-                .lower_is_better(),
-        );
+            .expect("every run has workers");
+        sample.push(Metric::mean(
+            "worker_busy_time_max",
+            Unit::Nanoseconds,
+            busiest as f64,
+        ));
         let completions: Vec<f64> = self
             .connections()
             .map(|(_, counters)| counters.valid as f64)

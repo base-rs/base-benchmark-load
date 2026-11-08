@@ -4,7 +4,7 @@
 //! The open loop, porting the fixed-rate client's `validate.py`: exact counts across workers, rejection of a corrupted response, and a stalled server whose delay stays visible.
 
 use super::{
-    MS, count, extension, load, metric, outcomes, record,
+    MS, count, extension, load, measured, metric, outcomes, record, requests,
     server::{Action, HELLO, Server},
 };
 use std::{sync::atomic::Ordering, time::Duration};
@@ -40,6 +40,8 @@ fn every_planned_request_is_validated_exactly_once() {
     assert_eq!(outcomes(&record, "drain"), 0);
     assert_eq!(extension(&record)["planned"], 1000);
     // The preflight request, the warmup, and the measured cohort, and nothing else.
+    assert_eq!(extension(&record)["preflight_requests"], 1);
+    assert_eq!(requests(&record), 1 + 200 + 1000);
     assert_eq!(server.requests.load(Ordering::Relaxed), 1 + 200 + 1000);
     let signature = format!("http1 status 200 body 13:{}", digest_of_hello());
     assert_eq!(record.signature.as_deref(), Some(signature.as_str()));
@@ -149,7 +151,7 @@ fn a_pipelined_stall_is_retained() {
     assert!(metric(&record, "send_delay_max") >= 36.0 * MS);
 }
 
-/// `validate.py`'s corruption case: the preflight's body becomes the expected body, and a later response that differs is invalid, not an error and not a success.
+/// `validate.py`'s corruption case: the preflight's body becomes the expected body, and a later response that differs is invalid, not an error and not a success. With no success, there are no operations, and so no record.
 #[test]
 fn a_corrupted_response_is_invalid() {
     let server = Server::start(|arrival| {
@@ -174,12 +176,49 @@ fn a_corrupted_response_is_invalid() {
         ],
     )
     .unwrap();
-    let record = record(&report);
-    assert_eq!(count(&record, "responses_valid"), 0);
-    assert_eq!(count(&record, "responses_invalid"), 200);
-    assert_eq!(count(&record, "invalid_body"), 200);
-    assert_eq!(count(&record, "errors"), 0);
-    assert_eq!(extension(&record)["histograms"]["latency"]["count"], 0);
-    assert!(record.samples[0].metric("latency_p99").is_some());
+    let outcomes = measured(&report);
+    assert_eq!(outcomes.valid, 0);
+    assert_eq!(outcomes.invalid_total(), 200);
+    assert_eq!(
+        outcomes.invalid[base_benchmark_load::InvalidKind::Body as usize],
+        200
+    );
+    assert_eq!(outcomes.error_total(), 0);
+    assert_eq!(report.statistics().distributions.latency.count(), 0);
     assert!(report.summary().contains("200 invalid (body)"));
+    assert!(report.record().is_err());
+}
+
+/// The address differs between equal runs, as when `base-benchmark` starts a server on a new port for every sample, so it is never a parameter, nor is the Host header that names it by default.
+#[test]
+fn parameters_do_not_depend_on_the_address() {
+    // Both servers live throughout, so their ports differ.
+    let servers = [Server::hello(), Server::hello()];
+    let parameters = |server: &Server| {
+        let report = load(
+            "rate",
+            server.address,
+            &[
+                "--rate",
+                "1000",
+                "--connections",
+                "1",
+                "--warmup",
+                "0",
+                "--duration",
+                "10ms",
+            ],
+        )
+        .unwrap();
+        let record = record(&report);
+        assert_eq!(
+            extension(&record)["context"]["address"],
+            server.address.to_string()
+        );
+        record.parameters
+    };
+    assert_ne!(servers[0].address, servers[1].address);
+    let first = parameters(&servers[0]);
+    assert_eq!(first, parameters(&servers[1]));
+    assert_eq!(first["request"]["host"], "default");
 }

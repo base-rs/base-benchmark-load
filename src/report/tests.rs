@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::statistics::{Request, Timing};
-use base_benchmark::Measurement;
+use base_benchmark::{Direction, Measurement};
 
 const MS: u64 = 1_000_000;
 
@@ -142,6 +142,32 @@ fn open_loop_records() {
         Measurement::Total { value: 10 }
     );
     assert_eq!(
+        value(&record, "requests_planned"),
+        Measurement::Total { value: 10 }
+    );
+    // Only properties of the server rank subjects; the client's diagnostics are neutral.
+    let direction = |name: &str| record.samples[0].metric(name).unwrap().direction;
+    for name in [
+        "responses_valid",
+        "requests_planned",
+        "completed_in_window",
+        "sent_in_window",
+        "client_saturated",
+        "worker_busy_time_max",
+        "connection_completions_min",
+        "drain_time",
+    ] {
+        assert_eq!(direction(name), Direction::Neutral, "{name}");
+    }
+    for name in [
+        "responses_invalid",
+        "errors",
+        "errors_timeout",
+        "latency_p99",
+    ] {
+        assert_eq!(direction(name), Direction::LowerIsBetter, "{name}");
+    }
+    assert_eq!(
         value(&record, "latency_max"),
         Measurement::Quantile {
             quantile: 1.0,
@@ -228,6 +254,7 @@ fn closed_loop_records_and_details() {
     assert_eq!(report.operations(), 1);
     let record = report.record().unwrap();
     assert!(record.samples[0].metric("latency_p50").is_none());
+    assert!(record.samples[0].metric("requests_planned").is_none());
     assert_eq!(
         value(&record, "service_time_max"),
         Measurement::Quantile {
@@ -262,18 +289,41 @@ fn records_need_operations() {
     let report = report(Mode::Closed, |_, _, _| {});
     let error = report.record().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    // Rate reports always have their planned cohort, and empty distributions are unavailable rather than zero.
-    let report = self::report(Mode::Rate, |_, _, _| {});
-    let record = report.record().unwrap();
-    assert!(matches!(
-        value(&record, "latency_p99"),
-        Measurement::Unavailable { .. }
-    ));
-    assert!(matches!(
-        value(&record, "latency_mean"),
-        Measurement::Unavailable { .. }
-    ));
-    assert!(report.summary().contains("latency: p50 -"));
+    assert_eq!(
+        error.to_string(),
+        "no valid response completed in the measured window"
+    );
+    // Operations are successes only, so a planned cohort without a valid response has none either, whatever its outcomes.
+    let timing = timing(false);
+    let report = self::report(Mode::Rate, |_, statistics, connection| {
+        let request = Request {
+            ordinal: 0,
+            planned: 11 * MS,
+            sent: 11 * MS,
+            eligible: 11 * MS,
+        };
+        statistics.complete(
+            &timing,
+            &request,
+            12 * MS,
+            Some(InvalidKind::Body),
+            connection,
+        );
+        statistics.fail(&timing, &request, 12 * MS, ErrorKind::Reset, connection);
+    });
+    assert_eq!(report.operations(), 0);
+    let error = report.record().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "no valid response to a request planned in the measured window"
+    );
+    // The summary is still written, with empty distributions.
+    let summary = report.summary();
+    assert!(
+        summary.contains("10 planned; 0 valid, 2 invalid, 2 failed"),
+        "{summary}"
+    );
+    assert!(summary.contains("latency: p50 -"), "{summary}");
 }
 
 #[test]
