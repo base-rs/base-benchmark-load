@@ -236,7 +236,7 @@ pub fn run(options: &Options) -> io::Result<Report> {
     })
 }
 
-/// Everything that changes the work, so that `base-benchmark` can reject subjects that did different work. Placement and the address are context, not parameters.
+/// Everything that changes the work, so that `base-benchmark` can reject subjects that did different work, and nothing that varies between equal runs. Placement and the address are context, not parameters, so the request is identified without the `Host` header added by default, which names the address.
 fn parameters(options: &Options, request: &RequestTemplate, expectation: &Expectation) -> Value {
     let body = match &options.body {
         _ if options.response.is_some() => json!("response"),
@@ -267,8 +267,9 @@ fn parameters(options: &Options, request: &RequestTemplate, expectation: &Expect
         "request": {
             "method": options.method,
             "path": options.path,
-            "length": request.bytes.len(),
-            "digest": digest(&request.bytes),
+            "host": if request.default_host { "default" } else { "header" },
+            "length": request.identity.len(),
+            "digest": digest(&request.identity),
         },
         "validation": {
             "status": expectation.status,

@@ -79,9 +79,11 @@ fn request_bodies_and_headers_are_sent() {
         ],
     );
     assert_eq!(count(&record, "responses_valid"), 50);
+    // The request is identified without the default Host header, which names the address.
     let request = &record.parameters["request"];
-    let expected = "POST /echo HTTP/1.1\r\nHost: ".len();
-    assert!(request["length"].as_u64().unwrap() > expected as u64);
+    let identity = "POST /echo HTTP/1.1\r\nX-Test: yes\r\nContent-Length: 7\r\n\r\npayload";
+    assert_eq!(request["length"], identity.len());
+    assert_eq!(request["host"], "default");
     assert_eq!(request["method"], "POST");
 }
 

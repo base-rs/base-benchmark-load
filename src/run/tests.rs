@@ -44,7 +44,24 @@ fn parameters_describe_the_work() {
         described["validation"]["headers"],
         json!([["content-type", "text/plain"]])
     );
-    assert_eq!(described["request"]["digest"], digest(&request.bytes));
+    assert_eq!(described["request"]["host"], "default");
+    assert_eq!(
+        described["request"]["digest"],
+        digest(b"GET / HTTP/1.1\r\n\r\n")
+    );
+    assert_eq!(described["request"]["length"], 18);
+    // The address varies between equal runs, such as runs against servers on different ports, so the default Host header that names it is not a parameter.
+    let elsewhere = RequestTemplate::new("GET", "/", "127.0.0.1:9999", &[], b"");
+    assert_eq!(parameters(&options, &elsewhere, &expectation), described);
+    // A Host header given explicitly changes the request, so it is.
+    let headers = [("Host".to_owned(), "example".to_owned())];
+    let explicit = RequestTemplate::new("GET", "/", "host", &headers, b"");
+    let explicit = parameters(&options, &explicit, &expectation);
+    assert_eq!(explicit["request"]["host"], "header");
+    assert_eq!(
+        explicit["request"]["digest"],
+        digest(b"GET / HTTP/1.1\r\nHost: example\r\n\r\n")
+    );
     options.body = BodyExpectation::Any;
     assert_eq!(
         parameters(&options, &request, &expectation)["validation"]["body"],
