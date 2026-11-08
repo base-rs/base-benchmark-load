@@ -68,11 +68,13 @@ fn runs_write_one_record_and_a_summary() {
     record.validate().unwrap();
     assert_eq!(count(&record, "responses_valid"), 50);
     assert!(text(&output.stderr).contains("latency: p50"));
-    // Quietly, with nothing to fail on.
+    // Quietly, with nothing to fail on. Every planned request is answered validly, however slowly.
     let output = command(&[
-        "closed",
+        "rate",
         "--address",
         &address,
+        "--rate",
+        "1000",
         "--connections",
         "1",
         "--warmup",

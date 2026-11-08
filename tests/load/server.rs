@@ -9,7 +9,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     thread::JoinHandle,
     time::Duration,
@@ -45,7 +45,8 @@ type Behaviour = Arc<dyn Fn(Arrival) -> Action + Send + Sync>;
 
 pub struct Server {
     pub address: SocketAddr,
-    stop: Arc<AtomicBool>,
+    /// The listening socket, which stays open, and so keeps its port, until the server is dropped, even after it stops listening: another test's server can then never take the port and receive this one's connections.
+    listener: Arc<TcpListener>,
     pub requests: Arc<AtomicUsize>,
     accept: Option<JoinHandle<()>>,
 }
@@ -60,27 +61,21 @@ impl Server {
         limit: usize,
         behaviour: impl Fn(Arrival) -> Action + Send + Sync + 'static,
     ) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
         let address = listener.local_addr().unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
         let behaviour: Behaviour = Arc::new(behaviour);
         let accept = {
-            let (stop, requests) = (stop.clone(), requests.clone());
+            let (listener, requests) = (listener.clone(), requests.clone());
             std::thread::spawn(move || {
-                let mut listener = Some(listener);
                 for connection in 0..limit {
-                    let Ok((stream, _)) = listener.as_ref().unwrap().accept() else {
+                    // Accepting fails once the server is dropped, which stops listening.
+                    let Ok((stream, _)) = listener.accept() else {
                         break;
                     };
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
                     if connection + 1 == limit {
-                        // Stop listening before serving the last connection, so that any connection attempted after its first response is refused. Shut the socket down rather than only closing it: a process spawned concurrently by another test may briefly hold a duplicate of the descriptor, which would keep it listening.
-                        let listening = listener.take().unwrap();
-                        // SAFETY: The descriptor is open.
-                        unsafe { libc::shutdown(listening.as_raw_fd(), libc::SHUT_RDWR) };
+                        // Stop listening before serving the last connection, so that any connection attempted after its first response is refused.
+                        stop_listening(&listener);
                     }
                     let (behaviour, requests) = (behaviour.clone(), requests.clone());
                     std::thread::spawn(move || serve(stream, connection, &*behaviour, &requests));
@@ -89,7 +84,7 @@ impl Server {
         };
         Self {
             address,
-            stop,
+            listener,
             requests,
             accept: Some(accept),
         }
@@ -100,11 +95,16 @@ impl Server {
     }
 }
 
+/// Stop listening, which also wakes a blocked `accept` with an error. Shut the socket down rather than only closing it: a process spawned concurrently by another test may briefly hold a duplicate of the descriptor, which would keep it listening. The socket stays bound to its port.
+fn stop_listening(listener: &TcpListener) {
+    // SAFETY: The descriptor is open while `listener` lives.
+    unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) };
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        // Wake the accept loop, if it is still accepting.
-        let _ = TcpStream::connect_timeout(&self.address, Duration::from_secs(1));
+        // Wake the accept loop by shutting its socket down, rather than by connecting to the port, which could reach another server.
+        stop_listening(&self.listener);
         let _ = self.accept.take().unwrap().join();
     }
 }
@@ -119,8 +119,10 @@ fn serve(
     let mut chunk = [0; 16 * 1024];
     let mut request = 0;
     loop {
-        let Ok(read) = stream.read(&mut chunk) else {
-            return;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
         };
         if read == 0 {
             return;

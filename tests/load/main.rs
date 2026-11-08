@@ -2,6 +2,8 @@
 // Copyright, 2026, by Samuel Williams.
 
 //! Runs against a small in-test server. Assertions are on counts, validation, and causality: a latency at least as long as a stall the server imposed, never an upper bound on how fast anything ran.
+//!
+//! No assertion depends on how much happened in a short time. An open loop ends once every planned request has an outcome, so its counts are exact however slowly it ran; the response and drain timeouts stay at their defaults of seconds, as watchdogs, unless a test is about them, and then it asserts only what the timeout causes. A closed loop is timed by its window, so the tests that need a valid response in one use [`CLOSED_WINDOW`].
 
 mod closed;
 mod command;
@@ -17,6 +19,9 @@ use base_benchmark_load::{Command, ErrorKind, Options, Outcomes, Period, Report,
 use serde_json::Value;
 
 pub const MS: f64 = 1_000_000.0;
+
+/// The window of a closed loop that must complete a valid response in it: long enough to be only a watchdog, since the client or server would have to stall for all of it to leave it empty.
+pub const CLOSED_WINDOW: &str = "2s";
 
 pub fn options(arguments: &[&str]) -> Options {
     match Options::parse(arguments.iter().map(|argument| argument.to_string())).unwrap() {
