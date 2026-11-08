@@ -10,9 +10,9 @@
 | `connection` | One connection's state machine, generic over its stream so tests can script it: queueing and writing requests, reading and completing responses, and failing every outstanding request with the connection's failure. |
 | `response` | Incremental response framing and validation: heads through `httparse`, bodies by length, chunks, or close, compared with the expected body or whole response as they arrive. |
 | `schedule` | The absolute open-loop schedule and each worker's cursor over its ordinals. |
-| `statistics` | Outcomes by period and kind, the distributions, reporting intervals, and per-connection counters, with exact merging. |
+| `statistics` | Outcomes by period and kind, the distributions, reporting intervals, and per-connection counters, including each connection's longest wait for a response, with exact merging. |
 | `histogram` | The log-linear histogram. |
-| `report` | Merging, fairness, saturation, the record, and the summary. |
+| `report` | Merging, fairness, starvation, saturation, the record, and the summary. |
 | `poller` and `os` | The `Poller` trait and its epoll implementation, and the few Linux calls the standard library lacks: CPU affinity, thread CPU time, the descriptor limit, non-blocking connects, and each CPU's software interrupt time from `/proc/stat`. |
 | `clock` | Monotonic nanoseconds from an origin, read only through the `Clock` trait. |
 
@@ -29,6 +29,10 @@ Sockets are registered edge-triggered for reading, writing, and closing, once. A
 ## Timing and periods
 
 The controller and the workers meet at a barrier twice: once every worker has pinned itself and connected, and again once the controller has published the start, or abandoned the run because a worker or the controller failed to set up. When a worker's thread cannot be spawned, the workers already started are waiting at the first meeting for the others, so the controller lowers the meeting's parties to them and itself, and abandons the run. The start is 100 ms after the first meeting, so every worker is waiting for it when it arrives. The warmup and window follow from it: `[start, start + warmup)` and `[start + warmup, start + warmup + duration)`. The drain deadline is `--drain-timeout` after the window. Rate-mode outcomes belong to the period of their planned time, closed-mode outcomes to the period they happen in.
+
+## Starvation
+
+Each connection's counters keep its requests planned in the window, set when the worker starts, and the longest wait of its requests outstanding in the window, with whether that request ended without a response. The wait is recorded where every request gets its outcome: when its response completes or it fails, from its send in the closed loop and its planned time in the open loop, which is how latency is measured there; and at the drain deadline, where a connection abandons its requests never sent, from the planned time of the oldest of them. A request whose outcome came before the window was not outstanding in it, and is left out. The report judges each connection from its counters alone: starved when the server answered none of its requests of the measured period, which in the open loop needs requests planned in the window, or when its longest wait is at least the window. Nothing about the workers or the shortfall enters the judgement, so starvation is never the client's saturation; the shortfall's `held_back` reason only states the starved connections beside its own attribution.
 
 ## Window markers
 

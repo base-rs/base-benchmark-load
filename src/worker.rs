@@ -289,6 +289,13 @@ pub fn work<P: Poller, C: Clock>(
         .step_by(load.workers)
         .map(|index| count_below(index as u64, settings.connections, settings.total))
         .sum();
+    for (connection, index) in connections
+        .iter_mut()
+        .zip((worker..load.connections).step_by(load.workers))
+    {
+        let below = |limit| count_below(index as u64, settings.connections, limit);
+        connection.counters.planned = below(settings.total) - below(settings.measured_first);
+    }
     let mut cursor = Cursor::new(worker, load.workers, load.connections);
     // When the cursor's ordinal is due, computed once per ordinal rather than on every poll; never in the closed loop.
     let due_time = |cursor: &Cursor| match settings.schedule {

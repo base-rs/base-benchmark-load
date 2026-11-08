@@ -553,6 +553,19 @@ fn abandoning_counts_unsent_requests_by_period() {
     assert_eq!(statistics.finished(), 6);
     assert_eq!(connection.state, State::Down { until: u64::MAX });
     assert!(!connection.has_work(0, &settings));
+    // Ordinal 0, planned at the start, waited a second unanswered; ordinal 2, the oldest never sent, waited 2 ms less.
+    assert_eq!(
+        (
+            connection.counters.wait_max,
+            connection.counters.wait_unanswered
+        ),
+        (1000 * MS, true)
+    );
+    // Abandoned again, with every request accounted for, nothing more waited.
+    connection.counters.wait_max = 0;
+    connection.abandon(START + 2000 * MS, &settings, &mut statistics);
+    assert_eq!(connection.counters.wait_max, 0);
+    assert_eq!(statistics.finished(), 6);
     // A connection that never connected still accounts for its warmup.
     let mut connection = Connection::<Script>::new(1);
     let mut statistics = WorkerStatistics::new(&settings.timing);
@@ -566,6 +579,18 @@ fn abandoning_counts_unsent_requests_by_period() {
         5
     );
     assert_eq!(statistics.disconnects, 0);
+    // Abandoned before the window, its requests were never outstanding in it, so none waited in it.
+    assert_eq!(connection.counters.wait_max, 0);
+    // Abandoned at the window's end, the oldest never sent, ordinal 1, waited from its planned time.
+    let mut connection = Connection::<Script>::new(1);
+    connection.abandon(START + 12 * MS, &settings, &mut statistics);
+    assert_eq!(
+        (
+            connection.counters.wait_max,
+            connection.counters.wait_unanswered
+        ),
+        (11 * MS, true)
+    );
 }
 
 #[test]

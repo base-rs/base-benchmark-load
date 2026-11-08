@@ -98,7 +98,7 @@ fn every_option() {
         "--fail-on",
         "invalid,errors",
         "--fail-on",
-        "saturated",
+        "saturated,starved",
         "--quiet",
     ]);
     std::fs::remove_file(&path).unwrap();
@@ -144,7 +144,8 @@ fn every_option() {
         FailOn {
             invalid: true,
             errors: true,
-            saturated: true
+            saturated: true,
+            starved: true
         }
     );
 }

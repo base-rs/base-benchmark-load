@@ -93,6 +93,50 @@ impl Server {
     pub fn hello() -> Self {
         Self::start(|_| Action::Respond(HELLO.to_vec()))
     }
+
+    /// A server with a fixed pool of `threads` serving threads, as Puma has, that answers every request with [`HELLO`]. It accepts every connection, but a thread serves one connection until it closes, so a connection accepted while every thread serves another waits, unread, until one closes; with keep-alive, none does. The preflight connection, accepted first, closes after its response, so exactly `threads` of the load's connections are served and every other is starved, whatever order they connect in, until the client closes connections.
+    pub fn pool(threads: usize) -> Self {
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (queue, accepted) = std::sync::mpsc::channel::<(TcpStream, usize)>();
+        let accepted = Arc::new(std::sync::Mutex::new(accepted));
+        for _ in 0..threads {
+            let (accepted, requests) = (accepted.clone(), requests.clone());
+            std::thread::spawn(move || {
+                loop {
+                    // The lock is held only to take the next connection; the queue closes when the accept loop ends.
+                    let next = accepted.lock().unwrap().recv();
+                    let Ok((stream, connection)) = next else {
+                        return;
+                    };
+                    serve(
+                        stream,
+                        connection,
+                        &|_| Action::Respond(HELLO.to_vec()),
+                        &requests,
+                    );
+                }
+            });
+        }
+        let accept = {
+            let listener = listener.clone();
+            std::thread::spawn(move || {
+                for connection in 0.. {
+                    let Ok((stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let _ = queue.send((stream, connection));
+                }
+            })
+        };
+        Self {
+            address,
+            listener,
+            requests,
+            accept: Some(accept),
+        }
+    }
 }
 
 /// Stop listening, which also wakes a blocked `accept` with an error. Shut the socket down rather than only closing it: a process spawned concurrently by another test may briefly hold a duplicate of the descriptor, which would keep it listening. The socket stays bound to its port.

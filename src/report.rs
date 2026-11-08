@@ -98,6 +98,32 @@ impl Spread {
     }
 }
 
+/// The connections the server starved, and how long it kept requests waiting.
+///
+/// A connection is starved when the server answered none of its requests of the measured period, with a valid or an invalid response: in the closed loop, none completed in the window; in the open loop, none of its requests planned in the window, if it had any. A connection is starved, too, when one of its requests outstanding in the window waited for its response at least as long as the window, from its send in the closed loop or its planned time in the open loop, to its response, its failure, or, if it was never sent, the drain deadline. Either way, the window measured nothing, or nothing timely, of the server's work for that connection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Starvation {
+    /// The connections, starved or not.
+    pub connections: usize,
+    /// The starved connections, by either criterion.
+    pub starved: usize,
+    /// The connections whose requests of the measured period the server answered none of.
+    pub unanswered: usize,
+    /// The connections with a request that waited at least as long as the window.
+    pub waited: usize,
+    /// The longest any request outstanding in the window waited for its response.
+    pub wait_max: u64,
+    /// Whether that request ended without a response, so that its wait is a lower bound.
+    pub wait_unanswered: bool,
+}
+
+impl Starvation {
+    /// The starved connections' share of the connections.
+    pub fn fraction(&self) -> f64 {
+        self.starved as f64 / self.connections as f64
+    }
+}
+
 /// One worker's results, as the report keeps them.
 #[derive(Debug)]
 pub struct WorkerReport {
@@ -256,6 +282,17 @@ impl Report {
             share * 100.0,
             self.planned
         );
+        let starvation = self.starvation();
+        // Starved connections hold their requests back whatever the connections' number and depth.
+        let starved = if starvation.starved > 0 {
+            format!(
+                "; {} of the {connections} connections {} starved, with requests the server left waiting",
+                starvation.starved,
+                were(starvation.starved)
+            )
+        } else {
+            String::new()
+        };
         let late = self
             .schedule_lag_max()
             .filter(|lag| *lag > self.schedule_lag_limit);
@@ -269,11 +306,85 @@ impl Report {
             )
         } else {
             return Some(format!(
-                "the server {held}; {capacity}, so if the server's healthy round trip is longer, the run needs more connections or depth"
+                "the server {held}; {capacity}, so if the server's healthy round trip is longer, the run needs more connections or depth{starved}"
             ));
         };
         Some(format!(
-            "the connections ({connections} × {depth} outstanding) {held}; the server is not named, since {distrust}, so the workers may have read late the responses that make room, and {capacity}"
+            "the connections ({connections} × {depth} outstanding) {held}; the server is not named, since {distrust}, so the workers may have read late the responses that make room, and {capacity}{starved}"
+        ))
+    }
+
+    /// Whether the server answered none of a connection's requests of the measured period, and whether one of its requests waited at least as long as the window: the two ways a connection is starved.
+    fn starved_by(&self, counters: &ConnectionCounters) -> (bool, bool) {
+        let expected = match self.mode {
+            Mode::Closed => true,
+            Mode::Rate => counters.planned > 0,
+        };
+        (
+            expected && counters.valid + counters.invalid == 0,
+            counters.wait_max >= self.window,
+        )
+    }
+
+    /// The connections the server starved, and the longest it kept a request waiting. Starvation is the server's doing, never the client's saturation: a worker reads every response as it arrives, unless it stops running, which its busy time and schedule lag show.
+    pub fn starvation(&self) -> Starvation {
+        let mut starvation = Starvation::default();
+        for (_, counters) in self.connections() {
+            let (unanswered, waited) = self.starved_by(counters);
+            starvation.connections += 1;
+            starvation.starved += usize::from(unanswered || waited);
+            starvation.unanswered += usize::from(unanswered);
+            starvation.waited += usize::from(waited);
+            if counters.wait_max > starvation.wait_max {
+                starvation.wait_max = counters.wait_max;
+                starvation.wait_unanswered = counters.wait_unanswered;
+            } else if counters.wait_max == starvation.wait_max {
+                starvation.wait_unanswered |= counters.wait_unanswered;
+            }
+        }
+        starvation
+    }
+
+    /// The longest wait for a response, in words: a lower bound when the request ended without one.
+    fn longest_wait(starvation: &Starvation) -> String {
+        if starvation.wait_unanswered {
+            format!(
+                "at least {}, and its request was never answered",
+                micros(starvation.wait_max)
+            )
+        } else {
+            micros(starvation.wait_max)
+        }
+    }
+
+    /// Why connections were starved, if any were: how many, by each criterion, and the longest wait.
+    pub fn starved(&self) -> Option<String> {
+        let starvation = self.starvation();
+        if starvation.starved == 0 {
+            return None;
+        }
+        let mut criteria = Vec::new();
+        if starvation.unanswered > 0 {
+            criteria.push(format!(
+                "the server answered none of the requests of {} of them in the window",
+                starvation.unanswered
+            ));
+        }
+        if starvation.waited > 0 {
+            criteria.push(format!(
+                "the server left a request of {} of them waiting at least as long as the {} window",
+                starvation.waited,
+                micros(self.window)
+            ));
+        }
+        Some(format!(
+            "{} of {} connections ({:.2}%) {} starved: {}; the longest wait for a response was {}",
+            starvation.starved,
+            starvation.connections,
+            starvation.fraction() * 100.0,
+            were(starvation.starved),
+            criteria.join("; "),
+            Self::longest_wait(&starvation)
         ))
     }
 
@@ -306,6 +417,9 @@ impl Report {
                     .into_iter()
                     .map(|reason| format!("the client was saturated: {reason}")),
             );
+        }
+        if fail_on.starved {
+            failures.extend(self.starved());
         }
         failures
     }
@@ -443,6 +557,33 @@ impl Report {
             Unit::Nanoseconds,
             busiest as f64,
         ));
+        // Starvation is the server's doing, so fewer starved connections and shorter waits are better.
+        let starvation = self.starvation();
+        sample.push(
+            Metric::mean(
+                "connections_starved",
+                Unit::Count,
+                starvation.starved as f64,
+            )
+            .lower_is_better(),
+        );
+        sample.push(
+            Metric::mean(
+                "connections_starved_fraction",
+                Unit::Count,
+                starvation.fraction(),
+            )
+            .lower_is_better(),
+        );
+        sample.push(
+            Metric::mean(
+                "response_wait_max",
+                Unit::Nanoseconds,
+                starvation.wait_max as f64,
+            )
+            .with_phase(Phase::Attached)
+            .lower_is_better(),
+        );
         let completions: Vec<f64> = self
             .connections()
             .map(|(_, counters)| counters.valid as f64)
@@ -563,6 +704,7 @@ impl Report {
             .map(|(name, histogram)| (name.to_owned(), histogram.to_json()))
             .collect();
         let saturation = self.saturation();
+        let starvation = self.starvation();
         let mut extension = json!({
             "context": self.context,
             "planned": (self.mode == Mode::Rate).then_some(self.planned),
@@ -589,6 +731,16 @@ impl Report {
                 "schedule_lag_limit_ns": (self.mode == Mode::Rate).then_some(self.schedule_lag_limit),
                 "shortfall_limit": (self.mode == Mode::Rate).then_some(self.shortfall_limit),
             },
+            "starvation": {
+                "connections": starvation.connections,
+                "starved": starvation.starved,
+                "fraction": starvation.fraction(),
+                "unanswered": starvation.unanswered,
+                "waited_window": starvation.waited,
+                "wait_max_ns": starvation.wait_max,
+                "wait_max_unanswered": starvation.wait_unanswered,
+                "reason": self.starved(),
+            },
             "shortfall": (self.mode == Mode::Rate).then(|| json!({
                 "sent": self.shortfall(),
                 "schedule": self.schedule_shortfall(),
@@ -603,6 +755,7 @@ impl Report {
             let details: Vec<Value> = self
                 .connections()
                 .map(|(worker, counters)| {
+                    let (unanswered, waited) = self.starved_by(counters);
                     json!({
                         "worker": worker,
                         "valid": counters.valid,
@@ -611,6 +764,10 @@ impl Report {
                         "mean_latency_ns": (counters.valid > 0).then(|| counters.latency_sum as f64 / counters.valid as f64),
                         "max_latency_ns": counters.latency_max,
                         "bytes_read": counters.bytes_read,
+                        "planned": (self.mode == Mode::Rate).then_some(counters.planned),
+                        "starved": unanswered || waited,
+                        "wait_max_ns": counters.wait_max,
+                        "wait_max_unanswered": counters.wait_unanswered,
                     })
                 })
                 .collect();
@@ -643,6 +800,30 @@ impl Report {
                     outcomes.valid,
                     outcomes.invalid_total(),
                     outcomes.error_total()
+                );
+                // The requests in flight at the window's end are drained, not abandoned, and their outcomes are not the window's, so they are stated apart.
+                let drain = self.total.period(Period::Drain);
+                let _ = writeln!(
+                    text,
+                    "in flight at the window's end, then drained: {} valid, {} invalid, {} failed",
+                    drain.valid,
+                    drain.invalid_total(),
+                    drain.error_total()
+                );
+            }
+        }
+        // Starvation comes before the distributions, which leave out every request the server never answered.
+        match self.starved() {
+            Some(reason) => {
+                let _ = writeln!(text, "STARVED: {reason}");
+            }
+            None => {
+                let starvation = self.starvation();
+                let _ = writeln!(
+                    text,
+                    "starved: none of {} connections; the longest wait for a response was {}",
+                    starvation.connections,
+                    Self::longest_wait(&starvation)
                 );
             }
         }
@@ -729,6 +910,11 @@ impl Report {
 /// The noun for `count` requests.
 fn requests(count: u64) -> &'static str {
     if count == 1 { "request" } else { "requests" }
+}
+
+/// The verb for `count` connections that were something.
+fn were(count: usize) -> &'static str {
+    if count == 1 { "was" } else { "were" }
 }
 
 /// A duration in nanoseconds, in readable units.

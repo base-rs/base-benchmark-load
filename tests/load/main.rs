@@ -13,6 +13,7 @@ mod placement;
 mod rate;
 mod server;
 mod setup;
+mod starved;
 
 use base_benchmark::{Measurement, ProcessRecord};
 use base_benchmark_load::{Command, ErrorKind, Options, Outcomes, Period, Report, run};

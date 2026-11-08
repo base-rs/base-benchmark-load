@@ -221,9 +221,21 @@ fn open_loop_records() {
         "latency_mean",
         "round_trip_p99",
         "send_delay_max",
+        "connections_starved",
+        "connections_starved_fraction",
+        "response_wait_max",
     ] {
         assert_eq!(direction(name), Direction::LowerIsBetter, "{name}");
     }
+    // No connection had requests planned in the window go unanswered, and none waited as long as the window.
+    assert_eq!(
+        value(&record, "connections_starved"),
+        Measurement::Mean { value: 0.0 }
+    );
+    assert_eq!(
+        value(&record, "response_wait_max"),
+        Measurement::Mean { value: 2000.0 }
+    );
     assert_eq!(
         value(&record, "latency_max"),
         Measurement::Quantile {
@@ -287,6 +299,19 @@ fn open_loop_records() {
         extension["shortfall"],
         json!({"sent": 1, "schedule": 0, "connection": 1, "held_back": null})
     );
+    assert_eq!(
+        extension["starvation"],
+        json!({
+            "connections": 4,
+            "starved": 0,
+            "fraction": 0.0,
+            "unanswered": 0,
+            "waited_window": 0,
+            "wait_max_ns": 2000,
+            "wait_max_unanswered": false,
+            "reason": null,
+        })
+    );
     assert_eq!(extension["preflight_requests"], 1);
     assert_eq!(extension["intervals"][0]["latency_count"], 8);
     assert_eq!(extension["intervals"][1]["offset_ns"], 5 * MS);
@@ -304,6 +329,14 @@ fn open_loop_records() {
     assert!(summary.contains("drained in 1.000 ms"));
     assert!(summary.contains("workers busy: 20% 20%; not saturated"));
     assert!(!summary.contains("problems"));
+    assert!(
+        summary.contains(
+            "\nstarved: none of 4 connections; the longest wait for a response was 2.00 µs\n"
+        ),
+        "{summary}"
+    );
+    // The open loop's cohort is drained by plan, so it has no drain period to state.
+    assert!(!summary.contains("then drained"));
 }
 
 #[test]
@@ -375,10 +408,37 @@ fn closed_loop_records_and_details() {
     assert_eq!(details[0]["errors"], 1);
     assert_eq!(details[1]["mean_latency_ns"], Value::Null);
     assert_eq!(details[2]["worker"], 1);
+    // In the closed loop, every connection is expected to be answered in the window, and three were not; the first was, but its request sent at the start waited about the whole window. Each request waits from its send.
+    assert_eq!(details[0]["planned"], Value::Null);
+    assert_eq!(
+        (&details[0]["starved"], &details[0]["wait_max_ns"]),
+        (&json!(true), &json!(12 * MS - 100))
+    );
+    assert_eq!(details[1]["starved"], true);
+    assert_eq!(
+        report.starvation(),
+        Starvation {
+            connections: 4,
+            starved: 4,
+            unanswered: 3,
+            waited: 1,
+            wait_max: 12 * MS - 100,
+            wait_unanswered: false,
+        }
+    );
     let summary = report.summary();
     assert!(summary.contains("closed loop over 4 connections"));
     assert!(summary.contains("measured window: 1 valid, 0 invalid, 1 failed"));
+    assert!(
+        summary.contains(
+            "in flight at the window's end, then drained: 0 valid, 0 invalid, 0 failed\n"
+        )
+    );
     assert!(summary.contains("problems: 1 reset"));
+    assert!(
+        summary.contains("\nSTARVED: 4 of 4 connections (100.00%) were starved: the server answered none of the requests of 3 of them in the window; the server left a request of 1 of them waiting at least as long as the 10.000 ms window; the longest wait for a response was 12.000 ms\n"),
+        "{summary}"
+    );
 }
 
 #[test]
@@ -476,6 +536,7 @@ fn saturation_and_failures() {
         invalid: true,
         errors: true,
         saturated: true,
+        starved: true,
     };
     let failures = report.failures(all);
     assert_eq!(failures[0], "2 invalid responses");
@@ -547,6 +608,7 @@ fn a_shortfall_the_server_held_back_does_not_saturate_the_client() {
         invalid: true,
         errors: true,
         saturated: true,
+        starved: true,
     };
     assert!(report.failures(all).is_empty());
     let record = report.record().unwrap();
@@ -695,5 +757,118 @@ fn one_request_is_singular() {
             .held_back()
             .unwrap()
             .starts_with("the server held back 1 request (12.50% of the 8 planned"),
+    );
+}
+
+/// A connection is starved when the server answered none of its requests of the measured period, or kept one waiting at least as long as the window. In the open loop, only a connection with requests planned in the window can go unanswered. Starvation is the server's doing, so it never saturates the client, and the requests a starved connection holds back are the server's.
+#[test]
+fn starved_connections_are_the_servers_doing() {
+    let timing = timing(false);
+    let mut report = report(Mode::Rate, |index, statistics, connection| {
+        connection.planned = 5;
+        statistics.reached(&timing, 11 * MS, 11 * MS);
+        statistics.busy = MS;
+        statistics.reached_in_window = 5;
+        statistics.sent_in_window = 3;
+        if index == 0 {
+            complete(&timing, statistics, connection, 11 * MS, 12 * MS);
+        } else {
+            // Never answered: its request timed out after 5 ms, and the others were never sent.
+            statistics.fail(
+                &timing,
+                &Request {
+                    ordinal: 1,
+                    planned: 11 * MS,
+                    sent: 11 * MS,
+                    eligible: 11 * MS,
+                },
+                16 * MS,
+                ErrorKind::Timeout,
+                connection,
+            );
+        }
+    });
+    report.connection_details = true;
+    assert_eq!(
+        report.starvation(),
+        Starvation {
+            connections: 4,
+            starved: 1,
+            unanswered: 1,
+            waited: 0,
+            wait_max: 5 * MS,
+            wait_unanswered: true,
+        }
+    );
+    let reason = "1 of 4 connections (25.00%) was starved: the server answered none of the requests of 1 of them in the window; the longest wait for a response was at least 5.000 ms, and its request was never answered";
+    assert_eq!(report.starved().as_deref(), Some(reason));
+    assert!(report.saturation().is_empty());
+    assert!(report.failures(FailOn::default()).is_empty());
+    let starved = FailOn {
+        starved: true,
+        ..FailOn::default()
+    };
+    assert_eq!(report.failures(starved), [reason]);
+    assert!(
+        report.held_back().unwrap().ends_with(
+            "; 1 of the 4 connections was starved, with requests the server left waiting"
+        )
+    );
+    let summary = report.summary();
+    assert!(
+        summary.contains(&format!("\nSTARVED: {reason}\n")),
+        "{summary}"
+    );
+    let record = report.record().unwrap();
+    record.validate().unwrap();
+    assert_eq!(
+        value(&record, "connections_starved"),
+        Measurement::Mean { value: 1.0 }
+    );
+    assert_eq!(
+        value(&record, "connections_starved_fraction"),
+        Measurement::Mean { value: 0.25 }
+    );
+    assert_eq!(
+        value(&record, "response_wait_max"),
+        Measurement::Mean {
+            value: (5 * MS) as f64
+        }
+    );
+    let extension = &record.extensions[EXTENSION];
+    assert_eq!(extension["starvation"]["reason"], reason);
+    let details = extension["connection_details"].as_array().unwrap();
+    assert_eq!(
+        (&details[2]["starved"], &details[2]["planned"]),
+        (&json!(true), &json!(5))
+    );
+    assert_eq!(details[2]["wait_max_unanswered"], true);
+    // A connection with nothing planned in the window cannot go unanswered in it.
+    assert_eq!(details[3]["starved"], false);
+    // An invalid response is an answer, though not a success.
+    report.workers[1].connections[0].invalid = 1;
+    assert_eq!(report.starvation().starved, 0);
+    assert_eq!(report.starved(), None);
+    // A wait as long as the window starves the connection, however it ended.
+    report.workers[1].connections[0].wait_max = 10 * MS;
+    assert_eq!(
+        report.starved().as_deref(),
+        Some(
+            "1 of 4 connections (25.00%) was starved: the server left a request of 1 of them waiting at least as long as the 10.000 ms window; the longest wait for a response was at least 10.000 ms, and its request was never answered"
+        )
+    );
+    report.workers[1].connections[0].wait_max = 10 * MS - 1;
+    assert_eq!(report.starved(), None);
+    // As long a wait elsewhere, answered, leaves the longest wait a lower bound.
+    report.workers[1].connections[0].wait_max = MS;
+    let starvation = report.starvation();
+    assert_eq!(
+        (starvation.wait_max, starvation.wait_unanswered),
+        (MS, true)
+    );
+    assert!(
+        report
+            .summary()
+            .contains("\nstarved: none of 4 connections; the longest wait for a response was at least 1.000 ms, and its request was never answered\n")
     );
 }

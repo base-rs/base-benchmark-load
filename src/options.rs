@@ -46,7 +46,7 @@ Output:
   --busy-limit FRACTION      Flag the client as saturated when a worker is busy for more of the window [0.8].
   --schedule-lag-limit DURATION  In rate mode, flag the client as saturated when a worker's 99th percentile schedule lag exceeds this [50us].
   --shortfall-limit FRACTION In rate mode, flag the client as saturated when the workers reached more of the requests planned in the window only after it; more that they reached in it but sent after it are reported as held back by the connections, or by the server when the client kept its schedule, without saturating the client [0.001].
-  --fail-on CLASSES          Exit unsuccessfully, without a record, on invalid responses, errors, or saturation: a comma-separated list of invalid, errors, saturated.
+  --fail-on CLASSES          Exit unsuccessfully, without a record, on invalid responses, errors, saturation, or starved connections: a comma-separated list of invalid, errors, saturated, starved.
   --quiet                    Do not write the summary to stderr.
 
 The record goes to stdout as one line of JSON. Other commands: help, version.
@@ -84,6 +84,8 @@ pub struct FailOn {
     pub invalid: bool,
     pub errors: bool,
     pub saturated: bool,
+    /// A connection the server starved: it answered none of the connection's requests in the window, or left one waiting at least as long as the window.
+    pub starved: bool,
 }
 
 /// A parsed command line.
@@ -505,9 +507,10 @@ fn fail_on(mut fail_on: FailOn, value: &str) -> io::Result<FailOn> {
             "invalid" => fail_on.invalid = true,
             "errors" => fail_on.errors = true,
             "saturated" => fail_on.saturated = true,
+            "starved" => fail_on.starved = true,
             _ => {
                 return Err(invalid(format!(
-                    "unknown --fail-on class {class:?}; expected invalid, errors, or saturated"
+                    "unknown --fail-on class {class:?}; expected invalid, errors, saturated, or starved"
                 )));
             }
         }

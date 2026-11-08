@@ -340,12 +340,17 @@ impl<T: Read + Write> Connection<T> {
         statistics.disconnects += 1;
     }
 
-    /// At the drain deadline: outstanding requests time out, and in the open loop, planned requests never sent are counted as unsent. The connection is closed for good.
+    /// At the drain deadline: outstanding requests time out, and in the open loop, planned requests never sent are counted as unsent, and the oldest of them waited from its planned time until now. The connection is closed for good.
     pub fn abandon(&mut self, now: u64, settings: &Settings, statistics: &mut WorkerStatistics) {
         if self.stream.is_some() {
             self.fail(ErrorKind::Timeout, now, settings, statistics);
         }
-        if settings.schedule.is_some() {
+        if let Some(schedule) = settings.schedule {
+            // The oldest request never sent has waited since it was planned, longest of those never sent.
+            if self.next_ordinal < settings.total {
+                let planned = settings.timing.start + schedule.offset(self.next_ordinal);
+                self.counters.waited(&settings.timing, planned, now, false);
+            }
             let warmup = count_below(
                 self.next_ordinal,
                 settings.connections,

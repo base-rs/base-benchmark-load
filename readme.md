@@ -2,11 +2,11 @@
 
 An HTTP load generator for Base benchmarks: closed-loop maximum throughput, and open-loop fixed-rate latency measured from each request's intended send time.
 
-**Status:** the first milestone: HTTP/1.1 keep-alive with pipelining, closed and open loops, validation of every response, errors by kind, fairness and saturation reporting, and a `base-benchmark` record. Linux only. Window markers for `base-benchmark` roles, Poisson arrivals, rate sweeps, TLS, and HTTP/2 come later; see [the architecture](context/architecture.md).
+**Status:** the first milestone: HTTP/1.1 keep-alive with pipelining, closed and open loops, validation of every response, errors by kind, fairness, starved connection, and saturation reporting, and a `base-benchmark` record. Linux only. Window markers for `base-benchmark` roles, Poisson arrivals, rate sweeps, TLS, and HTTP/2 come later; see [the architecture](context/architecture.md).
 
 ## Motivation
 
-Base compares its servers and schedulers with Tokio and Hyper. The client that drives those comparisons must be a fixed, neutral instrument: it must not share code with the subjects, must not hide server stalls through coordinated omission, and must report its own errors, invalid responses, and saturation next to its measurements. Its results are `base-benchmark` process records, so it can act as the driver of `base-benchmark` campaigns.
+Base compares its servers and schedulers with Tokio and Hyper. The client that drives those comparisons must be a fixed, neutral instrument: it must not share code with the subjects, must not hide server stalls through coordinated omission, and must report its own errors, invalid responses, and saturation next to its measurements, and the connections a server starves. Its results are `base-benchmark` process records, so it can act as the driver of `base-benchmark` campaigns.
 
 ## Usage
 
@@ -15,7 +15,7 @@ base-benchmark-load rate --address 127.0.0.1:8080 --rate 240k --connections 64 -
 base-benchmark-load closed --address 127.0.0.1:8080 --connections 64 --depth 4 --cpus 2-5 --duration 8s > record.json
 ```
 
-The record goes to stdout and a summary to stderr. See [Using `base-benchmark-load`](context/usage.md) for the modes, what each distribution measures, how outcomes are counted, saturation, and the record, and the [requirements](design/load-generator.md) it is built to.
+The record goes to stdout and a summary to stderr. See [Using `base-benchmark-load`](context/usage.md) for the modes, what each distribution measures, how outcomes are counted, starved connections, saturation, and the record, and the [requirements](design/load-generator.md) it is built to.
 
 ## Development
 

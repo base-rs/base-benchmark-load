@@ -40,7 +40,7 @@ mod worker;
 
 pub use histogram::Histogram;
 pub use options::{BodyExpectation, Command, FailOn, Mode, Options, USAGE};
-pub use report::{EXTENSION, Report, Spread, WORKLOAD};
+pub use report::{EXTENSION, Report, Spread, Starvation, WORKLOAD};
 pub use run::run;
 pub use statistics::{
     Distributions, ErrorKind, IntervalStatistics, InvalidKind, Outcomes, Period, WorkerStatistics,
