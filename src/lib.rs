@@ -42,7 +42,9 @@ pub use histogram::Histogram;
 pub use options::{BodyExpectation, Command, FailOn, Mode, Options, USAGE};
 pub use report::{EXTENSION, Report, Spread, WORKLOAD};
 pub use run::run;
-pub use statistics::{ErrorKind, InvalidKind, Outcomes, Period, WorkerStatistics};
+pub use statistics::{
+    Distributions, ErrorKind, IntervalStatistics, InvalidKind, Outcomes, Period, WorkerStatistics,
+};
 
 use std::{io::Write, process::ExitCode};
 

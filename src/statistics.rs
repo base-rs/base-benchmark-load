@@ -231,7 +231,7 @@ impl Default for Distributions {
 }
 
 impl Distributions {
-    pub fn merge(&mut self, other: &Self) {
+    pub(crate) fn merge(&mut self, other: &Self) {
         self.latency.merge(&other.latency);
         self.round_trip.merge(&other.round_trip);
         self.send_delay.merge(&other.send_delay);
@@ -272,7 +272,7 @@ pub struct WorkerStatistics {
 }
 
 impl WorkerStatistics {
-    pub fn new(timing: &Timing) -> Self {
+    pub(crate) fn new(timing: &Timing) -> Self {
         let intervals = (0..timing.interval_count())
             .map(|_| IntervalStatistics {
                 completions: 0,
@@ -309,7 +309,7 @@ impl WorkerStatistics {
         self.periods.iter().map(Outcomes::total).sum()
     }
 
-    pub fn sent(&mut self, timing: &Timing, now: u64) {
+    pub(crate) fn sent(&mut self, timing: &Timing, now: u64) {
         self.sent += 1;
         if timing.in_window(now) {
             self.sent_in_window += 1;
@@ -317,7 +317,7 @@ impl WorkerStatistics {
     }
 
     /// Record a complete response to `request` at `now`; `invalid` says why it was invalid, if it was.
-    pub fn complete(
+    pub(crate) fn complete(
         &mut self,
         timing: &Timing,
         request: &Request,
@@ -366,7 +366,7 @@ impl WorkerStatistics {
     }
 
     /// Record that `request` failed with `kind` at `now`.
-    pub fn fail(
+    pub(crate) fn fail(
         &mut self,
         timing: &Timing,
         request: &Request,
@@ -383,11 +383,11 @@ impl WorkerStatistics {
     }
 
     /// Record `count` planned requests of `period` that were never sent.
-    pub fn unsent(&mut self, period: Period, count: u64) {
+    pub(crate) fn unsent(&mut self, period: Period, count: u64) {
         self.periods[period as usize].errors[ErrorKind::Unsent as usize] += count;
     }
 
-    pub fn merge(&mut self, other: &Self) {
+    pub(crate) fn merge(&mut self, other: &Self) {
         for (outcomes, other) in self.periods.iter_mut().zip(&other.periods) {
             outcomes.merge(other);
         }
