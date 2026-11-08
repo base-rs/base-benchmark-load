@@ -208,6 +208,49 @@ fn workers_that_fail_to_set_up_return_nothing() {
     });
 }
 
+/// A poller whose every wait panics, as `connect` does when polling fails.
+struct Panicking(Epoll);
+
+impl Poller for Panicking {
+    fn add(&mut self, descriptor: RawFd, token: u64) -> io::Result<()> {
+        self.0.add(descriptor, token)
+    }
+
+    fn delete(&mut self, descriptor: RawFd) -> io::Result<()> {
+        self.0.delete(descriptor)
+    }
+
+    fn wait(&mut self, _: &mut [Event], _: i32) -> io::Result<usize> {
+        panic!("injected polling failure")
+    }
+}
+
+/// A worker that panics while connecting reports the failure as it unwinds, so the controller, waiting for every worker's setup, learns which one failed instead of waiting forever.
+#[test]
+fn workers_that_panic_while_setting_up_report_it() {
+    let fixture = Fixture::new();
+    let listener = listener();
+    let load = fixture.load(listener.local_addr().unwrap(), 2);
+    let start = Start::new(1);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            work(
+                &load,
+                0,
+                Epoll::new().map(Panicking),
+                &MonotonicClock::new(),
+                &start,
+            )
+        });
+        assert_eq!(
+            start.wait_for_workers().unwrap().to_string(),
+            "worker 0 panicked while setting up"
+        );
+        start.abort();
+        assert!(worker.join().is_err());
+    });
+}
+
 #[test]
 fn connecting_reports_immediate_failures() {
     let fixture = Fixture::new();

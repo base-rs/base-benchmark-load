@@ -188,6 +188,21 @@ fn preflight_reads_fail_when_their_timeout_cannot_be_set() {
     assert_eq!(error.to_string(), "no timeouts");
 }
 
+/// A worker that panics before it reports its setup fails the run with an error naming it, instead of leaving the controller waiting for it, and the workers that did set up are abandoned.
+#[test]
+fn a_worker_that_panics_while_setting_up_fails_the_run() {
+    let error = drive(2, None, 0, 0, &MonotonicClock::new(), |worker, start| {
+        let arrival = start.arrival(worker);
+        if worker == 1 {
+            panic!("injected failure");
+        }
+        assert_eq!(arrival.ready(Ok(())), None);
+        None
+    })
+    .unwrap_err();
+    assert_eq!(error.to_string(), "worker 1 panicked while setting up");
+}
+
 #[test]
 fn sleeping_until_a_past_instant_returns_at_once() {
     let clock = MonotonicClock::new();

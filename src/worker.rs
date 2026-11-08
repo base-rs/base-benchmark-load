@@ -101,6 +101,14 @@ impl Start {
         }
     }
 
+    /// The arrival of worker `worker` at the start, which it reports with [`Arrival::ready`]. Every worker takes one before it sets up.
+    pub fn arrival(&self, worker: usize) -> Arrival<'_> {
+        Arrival {
+            start: self,
+            worker,
+        }
+    }
+
     /// Report a worker's setup, wait for the others, and return the start, or `None` if the run was abandoned.
     fn ready(&self, setup: io::Result<()>) -> Option<u64> {
         if let Err(error) = setup {
@@ -137,6 +145,31 @@ impl Start {
     }
 }
 
+/// A worker's place at the [`Start`]. A worker that panics before it reports its setup drops its arrival, which reports the failure in its place, so that the controller and the other workers are not left waiting for it.
+#[derive(Debug)]
+pub struct Arrival<'a> {
+    start: &'a Start,
+    worker: usize,
+}
+
+impl Arrival<'_> {
+    /// Report the worker's setup, wait for the others, and return the start, or `None` if the run was abandoned.
+    pub fn ready(self, setup: io::Result<()>) -> Option<u64> {
+        let start = self.start;
+        std::mem::forget(self);
+        start.ready(setup)
+    }
+}
+
+impl Drop for Arrival<'_> {
+    fn drop(&mut self) {
+        self.start.ready(Err(io::Error::other(format!(
+            "worker {} panicked while setting up",
+            self.worker
+        ))));
+    }
+}
+
 /// What one worker measured, and each of its connections' counters.
 #[derive(Debug)]
 pub struct WorkerResult {
@@ -154,6 +187,7 @@ pub fn work<P: Poller, C: Clock>(
     clock: &C,
     start: &Start,
 ) -> Option<WorkerResult> {
+    let arrival = start.arrival(worker);
     let mut connections: Vec<Connection<TcpStream>> = (worker..load.connections)
         .step_by(load.workers)
         .map(|index| Connection::new(index as u64))
@@ -169,7 +203,7 @@ pub fn work<P: Poller, C: Clock>(
         Ok(poller) => (Ok(()), Some(poller)),
         Err(error) => (Err(error), None),
     };
-    let start = start.ready(setup)?;
+    let start = arrival.ready(setup)?;
     let mut poller = poller.expect("the run starts only when every worker set up");
     let affinity = os::affinity();
     let settings = load.settings(start);

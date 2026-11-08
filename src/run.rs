@@ -11,9 +11,9 @@ use crate::{
     request::RequestTemplate,
     response::{Expectation, Response, ResponseParser},
     schedule::Schedule,
-    worker::{Load, Start, work},
+    worker::{Load, Start, WorkerResult, work},
 };
-use base_benchmark::Interval;
+use base_benchmark::{Interval, Sample};
 use serde_json::{Value, json};
 use std::{
     io::{self, Read, Write},
@@ -134,9 +134,66 @@ fn sleep_until(clock: &MonotonicClock, instant: u64) {
     }
 }
 
+/// Control a run from the calling thread: start `workers` threads, each running `worker`, which reports its setup to the [`Start`] it is given; once all have set up, pin the calling thread to `controller_cpu`, if any, and start them together; measure the window with an [`Interval`]; and collect their results. Returns the start, the controller's sample, and each worker's result.
+///
+/// Fails when a worker fails to set up, including when it panics before it reports, or when the controller cannot pin its CPU. Every worker is joined first, so a panic is reported as the error that names its worker.
+fn drive(
+    workers: usize,
+    controller_cpu: Option<usize>,
+    warmup: u64,
+    duration: u64,
+    clock: &MonotonicClock,
+    worker: impl Fn(usize, &Start) -> Option<WorkerResult> + Sync,
+) -> io::Result<(u64, Sample, Vec<WorkerResult>)> {
+    let start = Start::new(workers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|index| {
+                let (worker, start) = (&worker, &start);
+                std::thread::Builder::new()
+                    .name(format!("load-worker-{index}"))
+                    .spawn_scoped(scope, move || worker(index, start))
+                    .expect("spawning a worker thread succeeds")
+            })
+            .collect();
+        // Pin the controller only once every worker exists: a thread inherits its creator's affinity, so pinning first would confine every worker without a CPU of its own to the controller's CPU.
+        let pinned = controller_cpu.map_or(Ok(()), os::pin);
+        if let Some(error) = start.wait_for_workers().or(pinned.err()) {
+            start.abort();
+            // A worker that panicked is joined here, so that the run fails with the error naming it rather than the scope panicking.
+            for handle in handles {
+                let _ = handle.join();
+            }
+            return Err(error);
+        }
+        let origin = clock.now() + START_LEAD;
+        start.publish(origin);
+        sleep_until(clock, origin.saturating_add(warmup));
+        // The controller's interval approximates the window, which the workers time exactly: it starts and ends when this thread wakes, a little after each boundary.
+        let interval = Interval::start().expect("measuring the current process succeeds");
+        sleep_until(
+            clock,
+            origin.saturating_add(warmup).saturating_add(duration),
+        );
+        let sample = interval
+            .finish(1)
+            .expect("measuring the current process succeeds");
+        let results = handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .expect("workers do not panic")
+                    .expect("started workers return their results")
+            })
+            .collect();
+        Ok((origin, sample, results))
+    })
+}
+
 /// Run the load the options describe, and report what it measured.
 ///
-/// Before the load, one preflight request checks that the server answers with a valid response, within the connect timeout. Fails without measuring when the address does not resolve, the preflight fails, a worker cannot pin its CPU or connect, or the calling thread, which controls the run, cannot pin its CPU. Unpinned workers keep the calling thread's affinity from before the run.
+/// Before the load, one preflight request checks that the server answers with a valid response, within the connect timeout. Fails without measuring when the address does not resolve, the preflight fails, a worker cannot pin its CPU or connect, or panics while setting up, or the calling thread, which controls the run, cannot pin its CPU. Unpinned workers keep the calling thread's affinity from before the run.
 pub fn run(options: &Options) -> io::Result<Report> {
     let address = resolve(&options.address)?;
     let request = RequestTemplate::new(
@@ -194,50 +251,14 @@ pub fn run(options: &Options) -> io::Result<Report> {
         expectation: &expectation,
     };
     let clock = MonotonicClock::new();
-    let start = Start::new(load.workers);
-    let (origin, sample, results) = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..load.workers)
-            .map(|worker| {
-                let (load, clock, start) = (&load, &clock, &start);
-                std::thread::Builder::new()
-                    .name(format!("load-worker-{worker}"))
-                    .spawn_scoped(scope, move || {
-                        work(load, worker, Epoll::new(), clock, start)
-                    })
-                    .expect("spawning a worker thread succeeds")
-            })
-            .collect();
-        // Pin the controller only once every worker exists: a thread inherits its creator's affinity, so pinning first would confine every worker without a CPU of its own to the controller's CPU.
-        let pinned = options.controller_cpu.map_or(Ok(()), os::pin);
-        if let Some(error) = start.wait_for_workers().or(pinned.err()) {
-            start.abort();
-            return Err(error);
-        }
-        let origin = clock.now() + START_LEAD;
-        start.publish(origin);
-        sleep_until(&clock, origin.saturating_add(load.warmup));
-        // The controller's interval approximates the window, which the workers time exactly: it starts and ends when this thread wakes, a little after each boundary.
-        let interval = Interval::start().expect("measuring the current process succeeds");
-        sleep_until(
-            &clock,
-            origin
-                .saturating_add(load.warmup)
-                .saturating_add(load.duration),
-        );
-        let sample = interval
-            .finish(1)
-            .expect("measuring the current process succeeds");
-        let results: Vec<_> = handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .expect("workers do not panic")
-                    .expect("started workers return their results")
-            })
-            .collect();
-        Ok((origin, sample, results))
-    })?;
+    let (origin, sample, results) = drive(
+        load.workers,
+        options.controller_cpu,
+        load.warmup,
+        load.duration,
+        &clock,
+        |worker, start| work(&load, worker, Epoll::new(), &clock, start),
+    )?;
     let workers: Vec<WorkerReport> = results
         .into_iter()
         .enumerate()
