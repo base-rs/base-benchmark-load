@@ -1,0 +1,20 @@
+before: 35 runs; 20 with p99 over 1 ms, 11 of them not flagged; 12 with p99 at most 100 µs, 1 of them flagged
+  missed: 500k p99 763,888 µs, busy 0.869, 113,178 planned in the window not sent in it
+  missed: 250k p99 248,644 µs, busy 0.553, 56,039 planned in the window not sent in it
+  missed: 600k p99 16,735,273 µs, busy 0.693, 2,103,196 planned in the window not sent in it
+  missed: 700k p99 17,230,201 µs, busy 0.709, 2,394,006 planned in the window not sent in it
+  missed: 650k p99 3,250,586 µs, busy 0.883, 588,919 planned in the window not sent in it
+  missed: 400k p99 9,000,976 µs, busy 0.679, 884,963 planned in the window not sent in it
+  missed: 500k p99 15,929,967 µs, busy 0.731, 1,618,457 planned in the window not sent in it
+  missed: 600k p99 16,508,781 µs, busy 0.609, 2,039,723 planned in the window not sent in it
+  missed: 600k p99 16,164,848 µs, busy 0.668, 1,990,349 planned in the window not sent in it
+  missed: 700k p99 16,827,548 µs, busy 0.680, 2,369,773 planned in the window not sent in it
+  missed: 500k p99 1,909 µs, busy 0.879, 0 planned in the window not sent in it
+  flagged: 600k p99 52.2 µs: worker 0 was busy for 99.8% of the window
+after: 35 runs; 21 with p99 over 1 ms, 0 of them not flagged; 11 with p99 at most 100 µs, 6 of them flagged
+  flagged: 500k p99 7.6 µs: worker 0 was busy for 82.9% of the window
+  flagged: 600k p99 7.9 µs: worker 0 was busy for 97.1% of the window
+  flagged: 500k p99 11.8 µs: worker 0 was busy for 84.4% of the window
+  flagged: 400k p99 42.1 µs: worker 0 was busy for 83.2% of the window
+  flagged: 500k p99 9.9 µs: worker 0 was busy for 82.0% of the window
+  flagged: 500k p99 10.1 µs: worker 0 was busy for 82.2% of the window

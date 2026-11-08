@@ -1,0 +1,4 @@
+b32e535a59d39a93db6b0ecf2f4bc3b821cb486ce99584f5a3aada70240bcbfd  load/target/release/base-benchmark-load
+302ccd244f1fc87b509b78c9ec3c3130998fd23f30518a7e2a60996f2e06e564  http/benchmarks/hello/target/release/base-http-hello-benchmark
+56a6e0f2d9add885734831b6274255ea9fd091651120ed85d5bb5993529adb9a  http/benchmarks/hello/fixed-rate-client/target/release/base-http-fixed-rate-client
+aff4df75ded9bae62eb0630ea810e1c3283b99f0fde52ab4b977a734b096c9a6  bin/wrk

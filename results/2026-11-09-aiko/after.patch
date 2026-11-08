@@ -1,0 +1,1158 @@
+diff --git a/src/connection/tests.rs b/src/connection/tests.rs
+--- a/src/connection/tests.rs	2026-11-09 02:48:20.000000000 +1300
++++ b/src/connection/tests.rs	2026-11-09 11:06:36.000000000 +1300
+@@ -11,16 +11,19 @@
+ /// The start of the test runs, so that times before it are representable.
+ const START: u64 = 1000 * MS;
+ 
+-/// A scripted stream: reads return the queued chunks, then would block; writes accept everything unless a result is queued.
++/// A scripted stream: reads return the queued chunks, one a read, then would block; writes accept everything unless a result is queued. Each chunk stands for what arrived before one read, so a chunk that follows another arrived after the read that took it, and would give an edge-triggered socket another event.
+ #[derive(Debug, Default)]
+ struct Script {
+     reads: VecDeque<io::Result<Vec<u8>>>,
++    /// How many reads were made.
++    read_calls: usize,
+     writes: VecDeque<io::Result<usize>>,
+     written: Vec<u8>,
+ }
+ 
+ impl Read for Script {
+     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
++        self.read_calls += 1;
+         match self.reads.pop_front() {
+             None => Err(io::ErrorKind::WouldBlock.into()),
+             Some(Err(error)) => Err(error),
+@@ -151,7 +154,7 @@
+         .push_back(Ok(RESPONSE.to_vec()));
+     let clock = StepClock::new(sent + 1000, 0);
+     connection
+-        .readable(&clock, &settings, &mut statistics)
++        .readable(&clock, false, &settings, &mut statistics)
+         .unwrap();
+     let distributions = &statistics.distributions;
+     assert_eq!(distributions.latency.max(), Some(1300));
+@@ -185,7 +188,12 @@
+         .push_back(Ok(RESPONSE.to_vec()));
+     let completed = START + 7 * MS + MS / 2;
+     connection
+-        .readable(&StepClock::new(completed, 0), &settings, &mut statistics)
++        .readable(
++            &StepClock::new(completed, 0),
++            false,
++            &settings,
++            &mut statistics,
++        )
+         .unwrap();
+     // The backlog is sent one at a time, as each response arrives, 200 ns after it.
+     for ordinal in 3..8u64 {
+@@ -198,7 +206,12 @@
+             .reads
+             .push_back(Ok(RESPONSE.to_vec()));
+         connection
+-            .readable(&StepClock::new(sent + 800, 0), &settings, &mut statistics)
++            .readable(
++                &StepClock::new(sent + 800, 0),
++                false,
++                &settings,
++                &mut statistics,
++            )
+             .unwrap();
+     }
+     let distributions = &statistics.distributions;
+@@ -225,16 +238,22 @@
+         connection.stream.as_ref().unwrap().written,
+         REQUEST.repeat(3)
+     );
+-    // Three responses, the last split across reads.
++    // Three responses, the last split across reads: its tail arrives after the read that took the rest, and has an event of its own.
+     let mut bytes = RESPONSE.repeat(3);
+     let tail = bytes.split_off(bytes.len() - 5);
+     let stream = connection.stream.as_mut().unwrap();
+     stream.reads.push_back(Ok(bytes));
+     stream.reads.push_back(Ok(tail));
++    let clock = StepClock::new(sent + 100, 10);
+     connection
+-        .readable(&StepClock::new(sent + 100, 10), &settings, &mut statistics)
++        .readable(&clock, false, &settings, &mut statistics)
++        .unwrap();
++    assert_eq!(connection.in_flight.len(), 1);
++    connection
++        .readable(&clock, false, &settings, &mut statistics)
+         .unwrap();
+     assert!(connection.in_flight.is_empty());
++    assert_eq!(connection.stream.as_ref().unwrap().read_calls, 2);
+     assert_eq!(statistics.period(Period::Measured).valid, 3);
+     // Ordinals 2, 3, and 4 were planned 2, 1, and 0 ms before they were sent together.
+     assert_eq!(statistics.distributions.send_delay.max(), Some(2 * MS));
+@@ -266,6 +285,33 @@
+     );
+ }
+ 
++/// A read that returns less than the buffer offered found nothing more queued, so the connection waits for the next event instead of reading again only to find that the socket would block. Whatever arrives later gives the socket that event. A spurious event, for bytes an earlier read already took, finds nothing to read.
++#[test]
++fn a_short_read_waits_for_the_next_event() {
++    let fixture = Fixture::new();
++    let settings = fixture.rate(1, 2);
++    let (mut connection, mut statistics) = open_measured(&settings, script([RESPONSE, RESPONSE]));
++    connection.dispatch(START + 3 * MS, 12, &settings, &mut statistics);
++    let clock = StepClock::new(START + 4 * MS, 0);
++    let reads = |connection: &Connection<Script>| connection.stream.as_ref().unwrap().read_calls;
++    for (event, valid) in [(1, 1), (2, 2), (3, 2)] {
++        connection
++            .readable(&clock, false, &settings, &mut statistics)
++            .unwrap();
++        assert_eq!(reads(&connection), event);
++        assert_eq!(statistics.period(Period::Measured).valid, valid);
++    }
++    // Reported with the close, the same response is followed by the end of the stream, which no later event would report.
++    let (mut connection, mut statistics) = open_measured(&settings, script([RESPONSE, b""]));
++    connection.dispatch(START + 3 * MS, 12, &settings, &mut statistics);
++    assert_eq!(
++        connection.readable(&clock, true, &settings, &mut statistics),
++        Err(ErrorKind::Eof)
++    );
++    assert_eq!(reads(&connection), 2);
++    assert_eq!(statistics.period(Period::Measured).valid, 1);
++}
++
+ #[test]
+ fn write_failures_are_classified() {
+     let fixture = Fixture::new();
+@@ -303,7 +349,7 @@
+         script.reads = VecDeque::from([Err(io::ErrorKind::Interrupted.into()), Err(error.into())]);
+         let (mut connection, mut statistics) = open(&settings, script, START);
+         assert_eq!(
+-            connection.readable(&StepClock::new(START, 1), &settings, &mut statistics),
++            connection.readable(&StepClock::new(START, 1), false, &settings, &mut statistics),
+             Err(kind)
+         );
+     }
+@@ -313,13 +359,13 @@
+ fn failures_are_charged_to_every_outstanding_request() {
+     let fixture = Fixture::new();
+     let settings = fixture.rate(1, 4);
+-    // A response, then the end of the stream with three requests outstanding.
++    // A response, then the end of the stream with three requests outstanding, reported by one event.
+     let (mut connection, mut statistics) = open(&settings, script([RESPONSE, b""]), START);
+     connection.next_ordinal = 1;
+     connection.dispatch(START + 5 * MS, 12, &settings, &mut statistics);
+     let now = START + 6 * MS;
+     let kind = connection
+-        .readable(&StepClock::new(now, 0), &settings, &mut statistics)
++        .readable(&StepClock::new(now, 0), true, &settings, &mut statistics)
+         .unwrap_err();
+     assert_eq!(kind, ErrorKind::Eof);
+     assert_eq!(statistics.idle_closes, 0);
+@@ -344,7 +390,7 @@
+     let settings = fixture.rate(1, 1);
+     let (mut connection, mut statistics) = open(&settings, script([&b""[..]]), START);
+     assert_eq!(
+-        connection.readable(&StepClock::new(START, 0), &settings, &mut statistics),
++        connection.readable(&StepClock::new(START, 0), false, &settings, &mut statistics),
+         Err(ErrorKind::Eof)
+     );
+     connection.fail(ErrorKind::Eof, START, &settings, &mut statistics);
+@@ -358,14 +404,14 @@
+     let settings = fixture.rate(1, 1);
+     let (mut connection, mut statistics) = open(&settings, script([RESPONSE]), START);
+     assert_eq!(
+-        connection.readable(&StepClock::new(START, 0), &settings, &mut statistics),
++        connection.readable(&StepClock::new(START, 0), false, &settings, &mut statistics),
+         Err(ErrorKind::Parse)
+     );
+     let (mut connection, mut statistics) =
+         open(&settings, script([&b"HTTP/1.1 2000\r\n\r\n"[..]]), START);
+     connection.dispatch(START + 3 * MS, 12, &settings, &mut statistics);
+     assert_eq!(
+-        connection.readable(&StepClock::new(START, 0), &settings, &mut statistics),
++        connection.readable(&StepClock::new(START, 0), false, &settings, &mut statistics),
+         Err(ErrorKind::Parse)
+     );
+ }
+@@ -379,7 +425,7 @@
+     connection.dispatch(START + 3 * MS, 12, &settings, &mut statistics);
+     let now = START + 4 * MS;
+     let kind = connection
+-        .readable(&StepClock::new(now, 0), &settings, &mut statistics)
++        .readable(&StepClock::new(now, 0), false, &settings, &mut statistics)
+         .unwrap_err();
+     assert_eq!(kind, ErrorKind::Closed);
+     connection.fail(kind, now, &settings, &mut statistics);
+@@ -403,9 +449,14 @@
+         connection.dispatch(START + 3 * MS, 12, &settings, &mut statistics),
+         2
+     );
++    // The body's last byte and the close arrive together, after the head and the first byte; their event reports the close.
+     let now = START + 4 * MS;
++    let clock = StepClock::new(now, 0);
++    connection
++        .readable(&clock, false, &settings, &mut statistics)
++        .unwrap();
+     let kind = connection
+-        .readable(&StepClock::new(now, 0), &settings, &mut statistics)
++        .readable(&clock, true, &settings, &mut statistics)
+         .unwrap_err();
+     assert_eq!(kind, ErrorKind::Closed);
+     connection.fail(kind, now, &settings, &mut statistics);
+@@ -433,6 +484,7 @@
+     connection
+         .readable(
+             &StepClock::new(START + 4 * MS, 0),
++            false,
+             &settings,
+             &mut statistics,
+         )
+@@ -462,6 +514,7 @@
+     connection
+         .readable(
+             &StepClock::new(START + 4 * MS, 0),
++            false,
+             &settings,
+             &mut statistics,
+         )
+@@ -530,7 +583,12 @@
+         .push_back(Ok(RESPONSE.repeat(2)));
+     // Completed in the warmup.
+     connection
+-        .readable(&StepClock::new(START + MS, 0), &settings, &mut statistics)
++        .readable(
++            &StepClock::new(START + MS, 0),
++            false,
++            &settings,
++            &mut statistics,
++        )
+         .unwrap();
+     assert_eq!(
+         connection.dispatch(START + MS + 10, 0, &settings, &mut statistics),
+@@ -546,6 +604,7 @@
+     connection
+         .readable(
+             &StepClock::new(START + 3 * MS, 0),
++            false,
+             &settings,
+             &mut statistics,
+         )
+@@ -565,7 +624,7 @@
+         .reads
+         .push_back(Ok(RESPONSE.to_vec()));
+     connection
+-        .readable(&StepClock::new(end, 0), &settings, &mut statistics)
++        .readable(&StepClock::new(end, 0), false, &settings, &mut statistics)
+         .unwrap();
+     let periods = [Period::Warmup, Period::Measured, Period::Drain]
+         .map(|period| statistics.period(period).valid);
+diff --git a/src/connection.rs b/src/connection.rs
+--- a/src/connection.rs	2026-11-09 02:48:20.000000000 +1300
++++ b/src/connection.rs	2026-11-09 11:06:36.000000000 +1300
+@@ -187,10 +187,13 @@
+         Ok(())
+     }
+ 
+-    /// Read until the socket would block, completing every response that arrives. An error ends the connection: the caller charges it to the outstanding requests with [`Connection::fail`].
++    /// Read what the socket holds, completing every response that arrives. An error ends the connection: the caller charges it to the outstanding requests with [`Connection::fail`].
++    ///
++    /// The socket is registered edge-triggered, so it must be read until nothing is left, but a read that returns less than the buffer offered has already found the socket empty, and the next read would only fail with `EWOULDBLOCK`: one wasted `recvfrom` per response. It is skipped. A TCP read returns less than it was offered only once it has taken everything queued, including what arrived while the read held the socket, which is queued as the read releases it. Whatever arrives after that wakes the socket's waiters again, which gives an edge-triggered registration a new event. When the event reported the peer's close or an error (`closed`), the close may have arrived with the data the read returns, before the event was reported, and then no later event reports it, so reading continues until the read reports the end of the stream, the error, or that it would block.
+     pub fn readable(
+         &mut self,
+         clock: &impl Clock,
++        closed: bool,
+         settings: &Settings,
+         statistics: &mut WorkerStatistics,
+     ) -> Result<(), ErrorKind> {
+@@ -202,6 +205,7 @@
+                 .stream
+                 .as_mut()
+                 .expect("only connected streams are read");
++            let offered = self.input.len() - self.end;
+             match stream.read(&mut self.input[self.end..]) {
+                 Ok(0) => return Err(self.end_of_stream(clock.now(), settings, statistics)),
+                 Ok(read) => {
+@@ -209,6 +213,9 @@
+                     statistics.bytes_read += read as u64;
+                     self.counters.bytes_read += read as u64;
+                     self.process(clock.now(), settings, statistics)?;
++                    if read < offered && !closed {
++                        return Ok(());
++                    }
+                 }
+                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+diff --git a/src/options/tests.rs b/src/options/tests.rs
+--- a/src/options/tests.rs	2026-11-09 02:48:20.000000000 +1300
++++ b/src/options/tests.rs	2026-11-09 11:06:36.000000000 +1300
+@@ -91,8 +91,10 @@
+         "--connection-details",
+         "--busy-limit",
+         "0.5",
+-        "--dispatch-lag-limit",
+-        "50µs",
++        "--schedule-lag-limit",
++        "75µs",
++        "--shortfall-limit",
++        "0.01",
+         "--fail-on",
+         "invalid,errors",
+         "--fail-on",
+@@ -135,7 +137,8 @@
+     );
+     assert!(options.connection_details && options.quiet);
+     assert_eq!(options.busy_limit, 0.5);
+-    assert_eq!(options.dispatch_lag_limit, Some(Duration::from_micros(50)));
++    assert_eq!(options.schedule_lag_limit, Duration::from_micros(75));
++    assert_eq!(options.shortfall_limit, 0.01);
+     assert_eq!(
+         options.fail_on,
+         FailOn {
+diff --git a/src/options.rs b/src/options.rs
+--- a/src/options.rs	2026-11-09 02:48:20.000000000 +1300
++++ b/src/options.rs	2026-11-09 11:07:13.135247713 +1300
+@@ -43,8 +43,9 @@
+ 
+ Output:
+   --connection-details       Include every connection's counters in the record.
+-  --busy-limit FRACTION      Flag the client as saturated when a worker is busy for more of the window [0.9].
+-  --dispatch-lag-limit DURATION  Flag the client as saturated when the 99th percentile dispatch lag exceeds this.
++  --busy-limit FRACTION      Flag the client as saturated when a worker is busy for more of the window [0.8].
++  --schedule-lag-limit DURATION  In rate mode, flag the client as saturated when the 99th percentile schedule lag exceeds this [50us].
++  --shortfall-limit FRACTION In rate mode, flag the client as saturated when more of the requests planned in the window were not sent in it [0.001].
+   --fail-on CLASSES          Exit unsuccessfully, without a record, on invalid responses, errors, or saturation: a comma-separated list of invalid, errors, saturated.
+   --quiet                    Do not write the summary to stderr.
+ 
+@@ -113,7 +114,8 @@
+     pub response: Option<Vec<u8>>,
+     pub connection_details: bool,
+     pub busy_limit: f64,
+-    pub dispatch_lag_limit: Option<Duration>,
++    pub schedule_lag_limit: Duration,
++    pub shortfall_limit: f64,
+     pub fail_on: FailOn,
+     pub quiet: bool,
+ }
+@@ -127,7 +129,7 @@
+ }
+ 
+ /// The options that take a value.
+-const VALUE_OPTIONS: [&str; 26] = [
++const VALUE_OPTIONS: [&str; 27] = [
+     "--address",
+     "--connections",
+     "--depth",
+@@ -152,10 +154,18 @@
+     "--expect-header",
+     "--response-file",
+     "--busy-limit",
+-    "--dispatch-lag-limit",
++    "--schedule-lag-limit",
++    "--shortfall-limit",
+     "--fail-on",
+ ];
+ 
++/// The default `--busy-limit`. On the evaluation host, one worker at 120,000 requests per second was busy for 76–77% of the window, with latency quantiles within 1.1 times the reference client's; at 140,000 it was busy for 86–88%, with a 99th percentile 1.3 times, and a 99.9th 2 to 3 times, the reference's, as `results/2026-11-09-hana` in the repository records.
++pub const DEFAULT_BUSY_LIMIT: f64 = 0.8;
++/// The default `--schedule-lag-limit`: twice the largest 99th percentile delay in reaching due requests that the evaluation host's healthy runs showed, 24 µs, and below what its overloaded runs showed.
++pub const DEFAULT_SCHEDULE_LAG_LIMIT: Duration = Duration::from_micros(50);
++/// The default `--shortfall-limit`. A run that keeps up sends within a few requests of its plan in the window, since its backlog is about the same at both ends of it; one in a thousand planned requests is a backlog growing by a millisecond a second.
++pub const DEFAULT_SHORTFALL_LIMIT: f64 = 0.001;
++
+ /// The most reporting intervals a window may have; each needs a small histogram per worker.
+ pub const INTERVAL_COUNT_LIMIT: u64 = 100_000;
+ 
+@@ -187,8 +197,9 @@
+             expect_headers: Vec::new(),
+             response: None,
+             connection_details: false,
+-            busy_limit: 0.9,
+-            dispatch_lag_limit: None,
++            busy_limit: DEFAULT_BUSY_LIMIT,
++            schedule_lag_limit: DEFAULT_SCHEDULE_LAG_LIMIT,
++            shortfall_limit: DEFAULT_SHORTFALL_LIMIT,
+             fail_on: FailOn::default(),
+             quiet: false,
+         }
+@@ -281,8 +292,11 @@
+                 }
+                 "--response-file" => read(&value).map(|bytes| options.response = Some(bytes)),
+                 "--busy-limit" => fraction(&value).map(|fraction| options.busy_limit = fraction),
+-                "--dispatch-lag-limit" => {
+-                    duration(&value).map(|limit| options.dispatch_lag_limit = Some(limit))
++                "--schedule-lag-limit" => {
++                    duration(&value).map(|limit| options.schedule_lag_limit = limit)
++                }
++                "--shortfall-limit" => {
++                    fraction(&value).map(|fraction| options.shortfall_limit = fraction)
+                 }
+                 _ => fail_on(options.fail_on, &value).map(|fail_on| options.fail_on = fail_on),
+             }?;
+diff --git a/src/os/tests.rs b/src/os/tests.rs
+--- a/src/os/tests.rs	2026-11-09 02:48:20.000000000 +1300
++++ b/src/os/tests.rs	2026-11-09 11:06:36.000000000 +1300
+@@ -92,3 +92,22 @@
+         assert!(!source.ends_with('\n'));
+     }
+ }
++
++#[test]
++fn softirq_times_are_read_per_cpu() {
++    let stat = "cpu  10 0 10 100 0 0 30 0 0 0\n\
++                cpu0 1 2 3 4 5 6 7 8 9 10\n\
++                cpu2 0 0 0 0 0 0 250 0\n\
++                cpu3 0 0 0\n\
++                cpu4 0 0 0 0 0 0 many 0\n\
++                \n\
++                intr 1 2 3 4 5 6 7 8\n";
++    // The total line, short or malformed lines, and other counters are left out.
++    assert_eq!(
++        softirq_from_stat(stat, 100).into_iter().collect::<Vec<_>>(),
++        [(0, 70_000_000), (2, 2_500_000_000)]
++    );
++    // This host's CPUs, of which the calling thread may run on at least one.
++    let times = softirq_times().unwrap();
++    assert!(affinity().iter().any(|cpu| times.contains_key(cpu)));
++}
+diff --git a/src/os.rs b/src/os.rs
+--- a/src/os.rs	2026-11-09 02:48:20.000000000 +1300
++++ b/src/os.rs	2026-11-09 11:06:36.000000000 +1300
+@@ -1,9 +1,10 @@
+ // Released under the MIT License.
+ // Copyright, 2026, by Samuel Williams.
+ 
+-//! The Linux calls the standard library does not offer: CPU affinity, thread CPU time, the descriptor limit, and non-blocking connects.
++//! The Linux calls the standard library does not offer: CPU affinity, thread CPU time, the descriptor limit, non-blocking connects, and each CPU's software interrupt time.
+ 
+ use std::{
++    collections::BTreeMap,
+     io,
+     net::{SocketAddr, TcpStream},
+     os::fd::{FromRawFd, OwnedFd},
+@@ -144,6 +145,25 @@
+         .map(|source| source.trim().to_owned())
+ }
+ 
++/// Each online CPU's time in software interrupts since boot, in nanoseconds, by CPU number, from `/proc/stat`.
++pub fn softirq_times() -> io::Result<BTreeMap<usize, u64>> {
++    // SAFETY: `sysconf` has no preconditions; `_SC_CLK_TCK` is always defined on Linux.
++    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
++    std::fs::read_to_string("/proc/stat").map(|stat| softirq_from_stat(&stat, ticks_per_second))
++}
++
++/// Each CPU's software interrupt time in `stat`, the text of `/proc/stat`, whose times count `ticks_per_second` ticks a second. The `softirq` field is the seventh of a `cpuN` line, after `user`, `nice`, `system`, `idle`, `iowait`, and `irq`.
++pub(crate) fn softirq_from_stat(stat: &str, ticks_per_second: u64) -> BTreeMap<usize, u64> {
++    stat.lines()
++        .filter_map(|line| {
++            let mut fields = line.split_ascii_whitespace();
++            let cpu = fields.next()?.strip_prefix("cpu")?.parse().ok()?;
++            let ticks: u64 = fields.nth(6)?.parse().ok()?;
++            Some((cpu, ticks.saturating_mul(1_000_000_000) / ticks_per_second))
++        })
++        .collect()
++}
++
+ #[cfg(test)]
+ /// A loopback address that refuses connections: a socket bound to a free port that never listens, which also keeps the port from being reused while it lives.
+ pub fn refusing() -> (OwnedFd, SocketAddr) {
+diff --git a/src/report/tests.rs b/src/report/tests.rs
+--- a/src/report/tests.rs	2026-11-09 02:48:20.000000000 +1300
++++ b/src/report/tests.rs	2026-11-09 11:06:36.000000000 +1300
+@@ -33,6 +33,8 @@
+                 affinity: vec![index + 2],
+                 statistics,
+                 connections: vec![connection, ConnectionCounters::default()],
++                // The second worker's CPU time in software interrupts could not be read.
++                softirq: (index == 0).then_some(3 * MS),
+             }
+         })
+         .collect();
+@@ -48,7 +50,8 @@
+         window_end: 20 * MS,
+         interval: 5 * MS,
+         busy_limit: 0.9,
+-        dispatch_lag_limit: None,
++        schedule_lag_limit: 50_000,
++        shortfall_limit: 0.1,
+         connection_details: false,
+         preflight_requests: 1,
+         context: json!({"version": "test"}),
+@@ -120,6 +123,7 @@
+     let timing = timing(false);
+     let mut report = report(Mode::Rate, |index, statistics, connection| {
+         for planned in [11, 12, 13, 14, 15] {
++            statistics.reached(&timing, planned * MS, planned * MS + 20);
+             complete(
+                 &timing,
+                 statistics,
+@@ -128,6 +132,11 @@
+                 planned * MS + 1000 * (index as u64 + 1),
+             );
+         }
++        // Reaching requests planned outside the window is not measured.
++        statistics.reached(&timing, 9 * MS, 10 * MS);
++        statistics.reached(&timing, 20 * MS, 30 * MS);
++        // One of the ten planned in the window was sent after it, within the limit of one in ten.
++        statistics.sent_in_window = 5 - index as u64;
+         statistics.busy = 2 * MS;
+         statistics.last_outcome = Some(21 * MS);
+     });
+@@ -138,11 +147,23 @@
+         .unwrap();
+     assert_eq!(report.operations(), 10);
+     assert_eq!(report.busy_fractions(), [0.2, 0.2]);
++    assert_eq!(report.shortfall(), 1);
+     assert!(report.saturation().is_empty());
+     let record = report.record().unwrap();
+     record.validate().unwrap();
+     assert_eq!(record.samples[0].operations, 10);
+     assert_eq!(
++        value(&record, "sent_in_window_shortfall"),
++        Measurement::Total { value: 1 }
++    );
++    assert_eq!(
++        value(&record, "schedule_lag_max"),
++        Measurement::Quantile {
++            quantile: 1.0,
++            value: 20.0
++        }
++    );
++    assert_eq!(
+         value(&record, "responses_valid"),
+         Measurement::Total { value: 10 }
+     );
+@@ -163,6 +184,9 @@
+         "drain_time",
+         "dispatch_lag_p99",
+         "dispatch_lag_mean",
++        "schedule_lag_p99",
++        "schedule_lag_mean",
++        "sent_in_window_shortfall",
+         "cpu_time",
+         "user_cpu_time",
+         "system_cpu_time",
+@@ -229,6 +253,21 @@
+     assert_eq!(extension["planned"], 10);
+     assert_eq!(extension["workers"][1]["cpu"], 3);
+     assert_eq!(extension["workers"][1]["affinity"], json!([3]));
++    assert_eq!(extension["workers"][0]["softirq_ns"], 3 * MS);
++    assert_eq!(extension["workers"][1]["softirq_ns"], Value::Null);
++    assert_eq!(extension["workers"][1]["schedule_lag_p99_ns"], 20);
++    assert_eq!(extension["histograms"]["schedule_lag"]["count"], 10);
++    assert_eq!(
++        extension["saturation"],
++        json!({
++            "saturated": false,
++            "reasons": [],
++            "busy_limit": 0.9,
++            "schedule_lag_limit_ns": 50_000,
++            "shortfall_limit": 0.1,
++            "shortfall": 1,
++        })
++    );
+     assert_eq!(extension["preflight_requests"], 1);
+     assert_eq!(extension["intervals"][0]["latency_count"], 8);
+     assert_eq!(extension["intervals"][1]["offset_ns"], 5 * MS);
+@@ -242,6 +281,7 @@
+     assert!(summary.starts_with("base-benchmark-load rate: 1000/s offered over 4 connections, depth 1, 2 workers; 10.000 ms warmup, 10.000 ms measured"), "{summary}");
+     assert!(summary.contains("measured cohort: 10 planned; 10 valid"));
+     assert!(summary.contains("latency: p50 1.00 µs"));
++    assert!(summary.contains("schedule_lag: p50 0.02 µs"), "{summary}");
+     assert!(summary.contains("drained in 1.000 ms"));
+     assert!(summary.contains("workers busy: 20% 20%; not saturated"));
+     assert!(!summary.contains("problems"));
+@@ -275,6 +315,17 @@
+     let direction = |name: &str| record.samples[0].metric(name).unwrap().direction;
+     assert_eq!(direction("service_time_p99"), Direction::LowerIsBetter);
+     assert_eq!(direction("dispatch_lag_p99"), Direction::Neutral);
++    // The closed loop has no schedule, so no schedule lag, shortfall, or limits on them.
++    assert!(record.samples[0].metric("schedule_lag_p99").is_none());
++    assert!(
++        record.samples[0]
++            .metric("sent_in_window_shortfall")
++            .is_none()
++    );
++    assert_eq!(report.shortfall(), 0);
++    let saturation = &record.extensions[EXTENSION]["saturation"];
++    assert_eq!(saturation["schedule_lag_limit_ns"], Value::Null);
++    assert_eq!(saturation["shortfall"], Value::Null);
+     assert_eq!(
+         value(&record, "service_time_max"),
+         Measurement::Quantile {
+@@ -351,6 +402,10 @@
+     let timing = timing(false);
+     let mut report = report(Mode::Rate, |index, statistics, connection| {
+         statistics.busy = if index == 0 { 95 * MS / 10 } else { MS };
++        // Worker 0 reached its request 60 µs late, worker 1 on time.
++        statistics.reached(&timing, 11 * MS, 11 * MS + 60_000 * (1 - index as u64));
++        // Each worker sent four of its five requests planned in the window.
++        statistics.sent_in_window = 4;
+         complete(&timing, statistics, connection, 11 * MS, 12 * MS);
+         statistics.complete(
+             &timing,
+@@ -378,13 +433,13 @@
+         );
+         statistics.connect_errors = 1;
+     });
+-    report.dispatch_lag_limit = Some(10);
+     let saturation = report.saturation();
+     assert_eq!(
+         saturation,
+         [
+             "worker 0 was busy for 95.0% of the window",
+-            "the 99th percentile dispatch lag, 0.05 µs, exceeds 0.01 µs"
++            "worker 0's 99th percentile schedule lag, 60.00 µs, exceeds 50.00 µs",
++            "2 of the 10 requests planned in the window (20.00%) were not sent in it",
+         ]
+     );
+     let none = FailOn::default();
+@@ -400,8 +455,9 @@
+         failures[1],
+         "2 failed requests and 2 failed connection attempts"
+     );
+-    assert_eq!(failures.len(), 4);
++    assert_eq!(failures.len(), 5);
+     assert!(failures[2].starts_with("the client was saturated: worker 0"));
++    assert!(failures[4].starts_with("the client was saturated: 2 of the 10"));
+     let record = report.record().unwrap();
+     assert_eq!(
+         value(&record, "client_saturated"),
+@@ -413,7 +469,9 @@
+     );
+     assert!(report.summary().contains("SATURATED: worker 0"));
+     assert!(report.summary().contains("problems: 2 invalid (status)"));
+-    // The lag limit alone does not apply without a measured lag.
+-    report.dispatch_lag_limit = Some(1_000_000_000);
++    assert_eq!(record.extensions[EXTENSION]["saturation"]["shortfall"], 2);
++    // At the limits, the lag and the shortfall are not reasons.
++    report.schedule_lag_limit = 60_000;
++    report.shortfall_limit = 0.2;
+     assert_eq!(report.saturation().len(), 1);
+ }
+diff --git a/src/report.rs b/src/report.rs
+--- a/src/report.rs	2026-11-09 02:48:20.000000000 +1300
++++ b/src/report.rs	2026-11-09 11:06:54.718797171 +1300
+@@ -22,8 +22,8 @@
+     ("p999", 0.999),
+     ("max", 1.0),
+ ];
+-/// The distribution of the client's own delay in sending, a diagnostic of the client rather than a property of the server.
+-const DISPATCH_LAG: &str = "dispatch_lag";
++/// The distributions of the client's own delays, diagnostics of the client rather than properties of the server.
++const CLIENT_DISTRIBUTIONS: [&str; 2] = ["dispatch_lag", "schedule_lag"];
+ 
+ /// The 64-bit FNV-1a digest of `bytes`, in hexadecimal: a compact identity for request templates and expected bodies.
+ pub fn digest(bytes: &[u8]) -> String {
+@@ -106,6 +106,8 @@
+     pub affinity: Vec<usize>,
+     pub statistics: WorkerStatistics,
+     pub connections: Vec<ConnectionCounters>,
++    /// The time its CPU spent in software interrupts over the controller's window, when it was pinned and `/proc/stat` could be read. Its thread's CPU time leaves this out, though on loopback much of it is the kernel delivering the worker's own packets.
++    pub softirq: Option<u64>,
+ }
+ 
+ /// Merge the workers' statistics exactly.
+@@ -134,7 +136,8 @@
+     pub(crate) window_end: u64,
+     pub(crate) interval: u64,
+     pub(crate) busy_limit: f64,
+-    pub(crate) dispatch_lag_limit: Option<u64>,
++    pub(crate) schedule_lag_limit: u64,
++    pub(crate) shortfall_limit: f64,
+     pub(crate) connection_details: bool,
+     /// The requests sent before the load, which have no outcome in the record.
+     pub(crate) preflight_requests: u64,
+@@ -159,7 +162,15 @@
+             .collect()
+     }
+ 
+-    /// Why the client may have limited the load: busy-polling uses every worker CPU whatever the load, so saturation is judged by busy time and dispatch lag instead.
++    /// How many of the requests planned in the window were not sent in it, in the open loop: how much the backlog of requests due but unsent grew over the window. A run that keeps up has about the same backlog at both ends of it.
++    pub fn shortfall(&self) -> u64 {
++        match self.mode {
++            Mode::Rate => self.planned.saturating_sub(self.total.sent_in_window),
++            Mode::Closed => 0,
++        }
++    }
++
++    /// Why the load may not be what the run claims: busy-polling uses every worker CPU whatever the load, so saturation is judged by busy time, by how late the workers reached due requests, and by whether the window's requests were sent in it.
+     pub fn saturation(&self) -> Vec<String> {
+         let mut reasons = Vec::new();
+         for (index, busy) in self.busy_fractions().into_iter().enumerate() {
+@@ -173,16 +184,22 @@
+         let lag = self
+             .total
+             .distributions
+-            .dispatch_lag
++            .schedule_lag
+             .value_at_quantile(0.99);
+-        if let (Some(lag), Some(limit)) = (lag, self.dispatch_lag_limit) {
+-            if lag > limit {
+-                reasons.push(format!(
+-                    "the 99th percentile dispatch lag, {}, exceeds {}",
+-                    micros(lag),
+-                    micros(limit)
+-                ));
+-            }
++        if let Some(lag) = lag.filter(|lag| *lag > self.schedule_lag_limit) {
++            reasons.push(format!(
++                "the 99th percentile schedule lag, {}, exceeds {}",
++                micros(lag),
++                micros(self.schedule_lag_limit)
++            ));
++        }
++        let shortfall = self.shortfall();
++        if shortfall as f64 > self.shortfall_limit * self.planned as f64 {
++            reasons.push(format!(
++                "{shortfall} of the {} requests planned in the window ({:.2}%) were not sent in it",
++                self.planned,
++                shortfall as f64 * 100.0 / self.planned as f64
++            ));
+         }
+         reasons
+     }
+@@ -227,18 +244,19 @@
+                 ("latency", &distributions.latency),
+                 ("round_trip", &distributions.round_trip),
+                 ("send_delay", &distributions.send_delay),
+-                (DISPATCH_LAG, &distributions.dispatch_lag),
++                ("dispatch_lag", &distributions.dispatch_lag),
++                ("schedule_lag", &distributions.schedule_lag),
+             ],
+             Mode::Closed => vec![
+                 ("service_time", &distributions.round_trip),
+-                (DISPATCH_LAG, &distributions.dispatch_lag),
++                ("dispatch_lag", &distributions.dispatch_lag),
+             ],
+         }
+     }
+ 
+     /// The `base-benchmark` process record, with one sample over the measured window.
+     ///
+-    /// Totals of the measured phase are divided by the operations in `base-benchmark` summaries, and only properties of the server have a direction: its timings, wall time per success, invalid responses, and errors are lower-is-better. Diagnostics of the client, such as its CPU time, context switches, dispatch lag, busy time, and saturation, are neutral, since a faster server makes the client busier.
++    /// Totals of the measured phase are divided by the operations in `base-benchmark` summaries, and only properties of the server have a direction: its timings, wall time per success, invalid responses, and errors are lower-is-better. Diagnostics of the client, such as its CPU time, context switches, dispatch and schedule lag, busy time, the shortfall, and saturation, are neutral, since a faster server makes the client busier.
+     ///
+     /// Fails when there are no operations to normalize by: a run without a single valid response in the measured period.
+     pub fn record(&self) -> io::Result<ProcessRecord> {
+@@ -294,11 +312,14 @@
+         // Per operation, these are the completions and sends per valid response, which describe the run rather than rank servers; throughput is the inverse of `wall_time` per operation.
+         sample.push(count("completed_in_window", self.total.completed_in_window));
+         sample.push(count("sent_in_window", self.total.sent_in_window));
+-        // Every valid response of the measured period is in every distribution, so none is empty.
++        if self.mode == Mode::Rate {
++            sample.push(count("sent_in_window_shortfall", self.shortfall()));
++        }
++        // Every valid response of the measured period is in every distribution, and the schedule lag holds every request planned in the window, which a valid response of the cohort was, so none is empty.
+         const NONEMPTY: &str = "a record has valid responses, which every distribution holds";
+-        // The server's timings are lower-is-better; the client's dispatch lag is neutral.
++        // The server's timings are lower-is-better; the client's delays are neutral.
+         let direction = |name: &str, metric: Metric| {
+-            if name == DISPATCH_LAG {
++            if CLIENT_DISTRIBUTIONS.contains(&name) {
+                 metric
+             } else {
+                 metric.lower_is_better()
+@@ -439,7 +460,9 @@
+                     "iterations": statistics.iterations,
+                     "sent": statistics.sent,
+                     "completed_in_window": statistics.completed_in_window,
++                    "softirq_ns": worker.softirq,
+                     "dispatch_lag_p99_ns": statistics.distributions.dispatch_lag.value_at_quantile(0.99),
++                    "schedule_lag_p99_ns": statistics.distributions.schedule_lag.value_at_quantile(0.99),
+                 })
+             })
+             .collect();
+@@ -488,7 +511,9 @@
+                 "saturated": !saturation.is_empty(),
+                 "reasons": saturation,
+                 "busy_limit": self.busy_limit,
+-                "dispatch_lag_limit_ns": self.dispatch_lag_limit,
++                "schedule_lag_limit_ns": (self.mode == Mode::Rate).then_some(self.schedule_lag_limit),
++                "shortfall_limit": (self.mode == Mode::Rate).then_some(self.shortfall_limit),
++                "shortfall": (self.mode == Mode::Rate).then_some(self.shortfall()),
+             },
+             "workers": workers,
+             "intervals": intervals,
+diff --git a/src/run.rs b/src/run.rs
+--- a/src/run.rs	2026-11-09 02:48:20.000000000 +1300
++++ b/src/run.rs	2026-11-09 11:06:36.000000000 +1300
+@@ -16,6 +16,7 @@
+ use base_benchmark::{Interval, Sample};
+ use serde_json::{Value, json};
+ use std::{
++    collections::BTreeMap,
+     io::{self, Read, Write},
+     net::{SocketAddr, TcpStream, ToSocketAddrs},
+     thread::Builder,
+@@ -135,7 +136,19 @@
+     }
+ }
+ 
+-/// Control a run from the calling thread: start `workers` threads, each running `worker`, which reports its setup to the [`Start`] it is given; once all have set up, pin the calling thread to `controller_cpu`, if any, and start them together; measure the window with an [`Interval`]; and collect their results. Returns the start, the controller's sample, and each worker's result. Each worker's thread is spawned from the builder `prepare` returns, given its index, a builder that names it, and the start.
++/// What the controller measured of a run.
++#[derive(Debug)]
++struct Controlled {
++    /// The start.
++    origin: u64,
++    /// The controller's measurement of the window.
++    sample: Sample,
++    /// Each CPU's time in software interrupts over the controller's window, unless `/proc/stat` could not be read.
++    softirq: Option<BTreeMap<usize, u64>>,
++    results: Vec<WorkerResult>,
++}
++
++/// Control a run from the calling thread: start `workers` threads, each running `worker`, which reports its setup to the [`Start`] it is given; once all have set up, pin the calling thread to `controller_cpu`, if any, and start them together; measure the window with an [`Interval`], and each CPU's software interrupt time over it; and collect their results. Each worker's thread is spawned from the builder `prepare` returns, given its index, a builder that names it, and the start.
+ ///
+ /// Fails when a worker's thread cannot be spawned, as when the process may have no more threads or memory; when a worker fails to set up, including when it panics before it reports; or when the controller cannot pin its CPU. The workers that started are released and joined first, so a panic is reported as the error that names its worker.
+ fn drive(
+@@ -146,7 +159,7 @@
+     clock: &MonotonicClock,
+     worker: impl Fn(usize, &Start) -> Option<WorkerResult> + Sync,
+     prepare: impl Fn(usize, Builder, &Start) -> io::Result<Builder>,
+-) -> io::Result<(u64, Sample, Vec<WorkerResult>)> {
++) -> io::Result<Controlled> {
+     let start = Start::new(workers);
+     std::thread::scope(|scope| {
+         let mut handles = Vec::with_capacity(workers);
+@@ -190,6 +203,7 @@
+         sleep_until(clock, origin.saturating_add(warmup));
+         // The controller's interval approximates the window, which the workers time exactly: it starts and ends when this thread wakes, a little after each boundary.
+         let interval = Interval::start().expect("measuring the current process succeeds");
++        let softirq_start = os::softirq_times().ok();
+         sleep_until(
+             clock,
+             origin.saturating_add(warmup).saturating_add(duration),
+@@ -197,6 +211,18 @@
+         let sample = interval
+             .finish(1)
+             .expect("measuring the current process succeeds");
++        let softirq = softirq_start
++            .zip(os::softirq_times().ok())
++            .map(|(start, end)| {
++                end.into_iter()
++                    .map(|(cpu, time)| {
++                        (
++                            cpu,
++                            time.saturating_sub(start.get(&cpu).copied().unwrap_or(time)),
++                        )
++                    })
++                    .collect()
++            });
+         let results = handles
+             .into_iter()
+             .map(|handle| {
+@@ -206,7 +232,12 @@
+                     .expect("started workers return their results")
+             })
+             .collect();
+-        Ok((origin, sample, results))
++        Ok(Controlled {
++            origin,
++            sample,
++            softirq,
++            results,
++        })
+     })
+ }
+ 
+@@ -270,7 +301,12 @@
+         expectation: &expectation,
+     };
+     let clock = MonotonicClock::new();
+-    let (origin, sample, results) = drive(
++    let Controlled {
++        origin,
++        sample,
++        softirq,
++        results,
++    } = drive(
+         load.workers,
+         options.controller_cpu,
+         load.warmup,
+@@ -282,11 +318,16 @@
+     let workers: Vec<WorkerReport> = results
+         .into_iter()
+         .enumerate()
+-        .map(|(index, result)| WorkerReport {
+-            cpu: options.cpus.get(index).copied(),
+-            affinity: result.affinity,
+-            statistics: result.statistics,
+-            connections: result.connections,
++        .map(|(index, result)| {
++            let cpu = options.cpus.get(index).copied();
++            WorkerReport {
++                cpu,
++                affinity: result.affinity,
++                statistics: result.statistics,
++                connections: result.connections,
++                softirq: cpu
++                    .and_then(|cpu| softirq.as_ref().and_then(|times| times.get(&cpu).copied())),
++            }
+         })
+         .collect();
+     let settings = load.settings(origin);
+@@ -302,7 +343,8 @@
+         window_end: settings.timing.window_end,
+         interval: load.interval,
+         busy_limit: options.busy_limit,
+-        dispatch_lag_limit: options.dispatch_lag_limit.map(nanoseconds),
++        schedule_lag_limit: nanoseconds(options.schedule_lag_limit),
++        shortfall_limit: options.shortfall_limit,
+         connection_details: options.connection_details,
+         preflight_requests: PREFLIGHT_REQUESTS,
+         context: json!({
+diff --git a/src/statistics.rs b/src/statistics.rs
+--- a/src/statistics.rs	2026-11-09 02:48:20.000000000 +1300
++++ b/src/statistics.rs	2026-11-09 11:06:36.000000000 +1300
+@@ -214,8 +214,10 @@
+     pub round_trip: Histogram,
+     /// Actual minus planned send time (open loop).
+     pub send_delay: Histogram,
+-    /// Actual send minus the time the request became eligible to send: the client's own delay.
++    /// Actual send minus the time the request became eligible to send, the later of its planned time and the moment the worker found its connection had room, by reading the response that freed it. It leaves out how long that response waited to be read, so it falls as a worker falls behind; [`Distributions::schedule_lag`] does not.
+     pub dispatch_lag: Histogram,
++    /// The time from each planned send to the moment the worker reached it on its schedule, whether or not its connection had room (open loop). Unlike the others, it covers every request planned in the window, whatever its outcome.
++    pub schedule_lag: Histogram,
+ }
+ 
+ impl Default for Distributions {
+@@ -226,6 +228,7 @@
+             round_trip: histogram(),
+             send_delay: histogram(),
+             dispatch_lag: histogram(),
++            schedule_lag: histogram(),
+         }
+     }
+ }
+@@ -236,6 +239,7 @@
+         self.round_trip.merge(&other.round_trip);
+         self.send_delay.merge(&other.send_delay);
+         self.dispatch_lag.merge(&other.dispatch_lag);
++        self.schedule_lag.merge(&other.schedule_lag);
+     }
+ }
+ 
+@@ -316,6 +320,15 @@
+         }
+     }
+ 
++    /// Record that the worker reached the request planned at `planned` on its schedule at `now`, if it was planned in the window.
++    pub(crate) fn reached(&mut self, timing: &Timing, planned: u64, now: u64) {
++        if timing.in_window(planned) {
++            self.distributions
++                .schedule_lag
++                .record(now.saturating_sub(planned));
++        }
++    }
++
+     /// Record a complete response to `request` at `now`; `invalid` says why it was invalid, if it was.
+     pub(crate) fn complete(
+         &mut self,
+diff --git a/src/worker/tests.rs b/src/worker/tests.rs
+--- a/src/worker/tests.rs	2026-11-09 02:48:20.000000000 +1300
++++ b/src/worker/tests.rs	2026-11-09 11:06:36.000000000 +1300
+@@ -546,6 +546,112 @@
+     assert_eq!(connection.state, State::Down { until: 3 * MS });
+ }
+ 
++/// Wait for events on `poller` and handle each, with `due` as the open loop's cursor, until `until` holds. The wait is only a watchdog: each event the test expects comes from something it already did, so a wait that finds none means the event was never given.
++fn handle_until(
++    connection: &mut Connection<TcpStream>,
++    poller: &mut Epoll,
++    settings: &Settings,
++    statistics: &mut WorkerStatistics,
++    until: impl Fn(&Connection<TcpStream>, &WorkerStatistics) -> bool,
++) {
++    let mut events = [Event::default(); EVENT_CAPACITY];
++    let clock = StepClock::new(3 * MS, 0);
++    while !until(connection, statistics) {
++        let count = poller.wait(&mut events, 10_000).unwrap();
++        assert!(count > 0, "the socket gave no event");
++        for event in &events[..count] {
++            handle(connection, poller, event, &clock, 2, settings, statistics);
++        }
++    }
++}
++
++/// A read that returns less than it was offered ends the read without another that would only find the socket empty, so the kernel's edge semantics must give whatever arrives later an event of its own: a response written after the read, and a close that arrives after the event that reported the data, even before the data is read. A close that arrives with the data is reported by the same event, which reads on to the end of the stream.
++#[test]
++fn edges_follow_a_short_read() {
++    let fixture = Fixture::new();
++    let listener = listener();
++    let address = listener.local_addr().unwrap();
++    let mut load = fixture.load(address, 1);
++    load.depth = 3;
++    let settings = load.settings(MS);
++    let valid = |count: u64| {
++        move |_: &Connection<TcpStream>, statistics: &WorkerStatistics| {
++            statistics.period(Period::Measured).valid == count
++        }
++    };
++    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
++    for close_with_data in [false, true] {
++        let mut poller = Epoll::new().unwrap();
++        let mut statistics = WorkerStatistics::new(&settings.timing);
++        let mut connection = connecting(address, &mut poller);
++        let (mut accepted, _) = listener.accept().unwrap();
++        // The connection completes and sends ordinals 0 and 1, the only ones due.
++        handle_until(
++            &mut connection,
++            &mut poller,
++            &settings,
++            &mut statistics,
++            |connection, _| connection.in_flight.len() == 2,
++        );
++        let mut requests = vec![0; 2 * fixture.request.bytes.len()];
++        accepted.read_exact(&mut requests).unwrap();
++        // The first response is read on its own event, with a read shorter than the buffer.
++        accepted.write_all(response).unwrap();
++        handle_until(
++            &mut connection,
++            &mut poller,
++            &settings,
++            &mut statistics,
++            valid(1),
++        );
++        let stream = connection.stream.as_ref().unwrap();
++        if close_with_data {
++            // The second response and the close both arrive before their event, which reports the close.
++            accepted.write_all(response).unwrap();
++            drop(accepted);
++            wait_for(stream, libc::POLLRDHUP);
++        } else {
++            // The second response arrives after the read; once its event is reported, the close arrives before the response is read.
++            accepted.write_all(response).unwrap();
++            wait_for(stream, libc::POLLIN);
++            let mut events = [Event::default(); EVENT_CAPACITY];
++            let mut reported = Vec::new();
++            while !reported.iter().any(|event: &Event| event.readable) {
++                let count = poller.wait(&mut events, 10_000).unwrap();
++                assert!(count > 0, "the second response gave no event");
++                reported.extend_from_slice(&events[..count]);
++            }
++            assert!(reported.iter().all(|event| !event.closed));
++            drop(accepted);
++            wait_for(stream, libc::POLLRDHUP);
++            let clock = StepClock::new(3 * MS, 0);
++            for event in &reported {
++                handle(
++                    &mut connection,
++                    &mut poller,
++                    event,
++                    &clock,
++                    2,
++                    &settings,
++                    &mut statistics,
++                );
++            }
++            assert_eq!(statistics.period(Period::Measured).valid, 2);
++            assert_eq!(connection.state, State::Open);
++        }
++        // Either way, the end of the stream is found.
++        handle_until(
++            &mut connection,
++            &mut poller,
++            &settings,
++            &mut statistics,
++            |connection, _| connection.state != State::Open,
++        );
++        assert_eq!(statistics.period(Period::Measured).valid, 2);
++        assert_eq!(statistics.disconnects, 1);
++    }
++}
++
+ #[test]
+ fn maintenance_times_out_connections_and_retries_failed_ones() {
+     let fixture = Fixture::new();
+diff --git a/src/worker.rs b/src/worker.rs
+--- a/src/worker.rs	2026-11-09 02:48:20.000000000 +1300
++++ b/src/worker.rs	2026-11-09 11:06:36.000000000 +1300
+@@ -353,13 +353,17 @@
+         }
+         while now >= next_due {
+             let local = cursor.local();
++            let planned = next_due;
+             cursor.advance();
+             next_due = due_time(&cursor);
+             let due = cursor.ordinal().min(settings.total);
++            // The worker reaches the request now, whether or not its connection has room to send it: how late this is measures the worker alone, however long its connection's last response waited to be read.
++            let reached = clock.now();
++            statistics.reached(&settings.timing, planned, reached);
+             send(
+                 &mut connections[local],
+                 &mut poller,
+-                clock.now(),
++                reached,
+                 due,
+                 &settings,
+                 &mut statistics,
+@@ -506,7 +510,7 @@
+         State::Open => {
+             let mut result = Ok(());
+             if event.readable || event.closed {
+-                result = connection.readable(clock, settings, statistics);
++                result = connection.readable(clock, event.closed, settings, statistics);
+             }
+             let result = result.and_then(|()| {
+                 connection.dispatch(clock.now(), due, settings, statistics);
+diff --git a/tests/load/rate.rs b/tests/load/rate.rs
+--- a/tests/load/rate.rs	2026-11-09 02:48:20.000000000 +1300
++++ b/tests/load/rate.rs	2026-11-09 11:06:36.000000000 +1300
+@@ -46,7 +46,13 @@
+     let signature = format!("http1 status 200 body 13:{}", digest_of_hello());
+     assert_eq!(record.signature.as_deref(), Some(signature.as_str()));
+     // Every distribution counts the cohort, and quantiles are ordered.
+-    for name in ["latency", "round_trip", "send_delay", "dispatch_lag"] {
++    for name in [
++        "latency",
++        "round_trip",
++        "send_delay",
++        "dispatch_lag",
++        "schedule_lag",
++    ] {
+         assert_eq!(
+             extension(&record)["histograms"][name]["count"],
+             1000,
+@@ -119,6 +125,47 @@
+     assert!(intervals[0]["latency_max_ns"].as_f64().unwrap() >= 40.0 * MS);
+ }
+ 
++/// A run whose window ends with requests it planned in it still unsent did not offer its rate in the window, so the run is flagged as saturated, whichever side held the requests back. Here the server stalls the response to the request planned 150 ms into a 200 ms window for 100 ms, so the 49 requests planned after it on the one connection can only be sent after the window, however fast the client is.
++#[test]
++fn requests_planned_in_the_window_but_sent_after_it_are_a_shortfall() {
++    let server = Server::start(|arrival| match (arrival.connection, arrival.request) {
++        (1, 150) => Action::Delay(Duration::from_millis(100), HELLO.to_vec()),
++        _ => Action::Respond(HELLO.to_vec()),
++    });
++    let report = load(
++        "rate",
++        server.address,
++        &[
++            "--rate",
++            "1000",
++            "--connections",
++            "1",
++            "--warmup",
++            "0",
++            "--duration",
++            "200ms",
++        ],
++    )
++    .unwrap();
++    let record = record(&report);
++    assert_eq!(count(&record, "responses_valid"), 200);
++    assert!(report.shortfall() >= 49, "{}", report.shortfall());
++    assert_eq!(
++        count(&record, "sent_in_window_shortfall"),
++        report.shortfall()
++    );
++    assert_eq!(count(&record, "sent_in_window"), 200 - report.shortfall());
++    let reasons = report.saturation();
++    assert!(
++        reasons
++            .iter()
++            .any(|reason| reason.contains("of the 200 requests planned in the window")),
++        "{reasons:?}"
++    );
++    assert_eq!(metric(&record, "client_saturated"), 1.0);
++    assert!(report.summary().contains("were not sent in it"));
++}
++
+ /// With pipelining, requests sent behind the stalled one are on the wire and still wait for it.
+ #[test]
+ fn a_pipelined_stall_is_retained() {

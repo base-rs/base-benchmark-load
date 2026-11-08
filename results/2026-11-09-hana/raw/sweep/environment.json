@@ -1,0 +1,40 @@
+{
+ "argv": [
+  "scripts/evaluate.py",
+  "rate",
+  "--output",
+  "out/sweep",
+  "--backends",
+  "base-iouring-raw",
+  "tokio-task-raw",
+  "--clients",
+  "load",
+  "fixed",
+  "--rates",
+  "100000",
+  "140000",
+  "160000",
+  "180000",
+  "200000",
+  "220000",
+  "240000",
+  "--repetitions",
+  "1",
+  "--warmup",
+  "1",
+  "--duration",
+  "4"
+ ],
+ "utc": 1794171715.427604,
+ "uname": [
+  "Linux",
+  "hana",
+  "7.2.14-arch1-1",
+  "#1 SMP PREEMPT_DYNAMIC Fri, 30 Oct 2026 14:32:40 +0000",
+  "x86_64"
+ ],
+ "loadavg": "1.37 1.84 1.44 1/685 1260871\n",
+ "governors": [
+  "powersave"
+ ]
+}
