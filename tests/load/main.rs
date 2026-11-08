@@ -7,6 +7,7 @@ mod closed;
 mod command;
 mod errors;
 mod features;
+mod placement;
 mod rate;
 mod server;
 mod setup;

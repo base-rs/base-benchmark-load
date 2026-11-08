@@ -100,6 +100,8 @@ impl Spread {
 #[derive(Debug)]
 pub struct WorkerReport {
     pub cpu: Option<usize>,
+    /// The CPUs the worker could run on.
+    pub affinity: Vec<usize>,
     pub statistics: WorkerStatistics,
     pub connections: Vec<ConnectionCounters>,
 }
@@ -410,6 +412,7 @@ impl Report {
                 let statistics = &worker.statistics;
                 json!({
                     "cpu": worker.cpu,
+                    "affinity": worker.affinity,
                     "busy_fraction": busy,
                     "busy_ns": statistics.busy,
                     "cpu_ns": statistics.cpu,

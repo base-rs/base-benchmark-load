@@ -30,6 +30,18 @@ pub fn pin(cpu: usize) -> io::Result<()> {
     .map_err(|error| io::Error::new(error.kind(), format!("pinning to CPU {cpu}: {error}")))
 }
 
+/// The CPUs the calling thread may run on, in increasing order.
+pub fn affinity() -> Vec<usize> {
+    // SAFETY: `set` is a valid, initialized CPU set of the size passed. Querying the calling thread with a set of `CPU_SETSIZE` CPUs cannot fail, and `CPU_ISSET` stays within the set.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::sched_getaffinity(0, std::mem::size_of_val(&set), &mut set);
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|cpu| libc::CPU_ISSET(*cpu, &set))
+            .collect()
+    }
+}
+
 /// The calling thread's CPU time in nanoseconds.
 pub fn thread_cpu_time() -> u64 {
     let mut time = libc::timespec {

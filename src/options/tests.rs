@@ -284,6 +284,18 @@ fn invalid_combinations() {
             "cannot be shared",
         ),
         (
+            &[
+                "closed",
+                "--address",
+                "a:1",
+                "--cpus",
+                "2-5",
+                "--controller-cpu",
+                "3",
+            ],
+            "--controller-cpu 3 is also a worker's CPU",
+        ),
+        (
             &["closed", "--address", "a:1", "--duration", "0"],
             "must be positive",
         ),

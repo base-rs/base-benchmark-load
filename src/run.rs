@@ -100,7 +100,7 @@ fn sleep_until(clock: &MonotonicClock, instant: u64) {
 
 /// Run the load the options describe, and report what it measured.
 ///
-/// Before the load, one preflight request checks that the server answers with a valid response, within the connect timeout. Fails without measuring when the address does not resolve, the preflight fails, or a worker cannot pin its CPU or connect.
+/// Before the load, one preflight request checks that the server answers with a valid response, within the connect timeout. Fails without measuring when the address does not resolve, the preflight fails, a worker cannot pin its CPU or connect, or the calling thread, which controls the run, cannot pin its CPU. Unpinned workers keep the calling thread's affinity from before the run.
 pub fn run(options: &Options) -> io::Result<Report> {
     let address = resolve(&options.address)?;
     let request = RequestTemplate::new(
@@ -138,9 +138,6 @@ pub fn run(options: &Options) -> io::Result<Report> {
         expectation.body = preflight.body;
     }
     os::raise_descriptor_limit(options.connections as u64 + DESCRIPTOR_ALLOWANCE);
-    if let Some(cpu) = options.controller_cpu {
-        os::pin(cpu)?;
-    }
     let load = Load {
         address,
         connections: options.connections,
@@ -172,7 +169,9 @@ pub fn run(options: &Options) -> io::Result<Report> {
                     .expect("spawning a worker thread succeeds")
             })
             .collect();
-        if let Some(error) = start.wait_for_workers() {
+        // Pin the controller only once every worker exists: a thread inherits its creator's affinity, so pinning first would confine every worker without a CPU of its own to the controller's CPU.
+        let pinned = options.controller_cpu.map_or(Ok(()), os::pin);
+        if let Some(error) = start.wait_for_workers().or(pinned.err()) {
             start.abort();
             return Err(error);
         }
@@ -206,6 +205,7 @@ pub fn run(options: &Options) -> io::Result<Report> {
         .enumerate()
         .map(|(index, result)| WorkerReport {
             cpu: options.cpus.get(index).copied(),
+            affinity: result.affinity,
             statistics: result.statistics,
             connections: result.connections,
         })

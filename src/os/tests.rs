@@ -18,7 +18,9 @@ fn pinning_reports_the_cpu() {
         // The calling thread can always run on a CPU it is already allowed to use.
         // SAFETY: `sched_getcpu` has no preconditions.
         let cpu = unsafe { libc::sched_getcpu() } as usize;
+        assert!(affinity().contains(&cpu));
         pin(cpu).unwrap();
+        assert_eq!(affinity(), [cpu]);
         // CPU_SETSIZE - 1 is offline on any machine these tests run on.
         let error = pin(libc::CPU_SETSIZE as usize - 1).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

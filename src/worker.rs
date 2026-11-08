@@ -141,6 +141,8 @@ impl Start {
 /// What one worker measured, and each of its connections' counters.
 #[derive(Debug)]
 pub struct WorkerResult {
+    /// The CPUs the worker could run on, after it was pinned, if it was.
+    pub affinity: Vec<usize>,
     pub statistics: WorkerStatistics,
     pub connections: Vec<ConnectionCounters>,
 }
@@ -170,6 +172,7 @@ pub fn work<P: Poller, C: Clock>(
     };
     let start = start.ready(setup)?;
     let mut poller = poller.expect("the run starts only when every worker set up");
+    let affinity = os::affinity();
     let settings = load.settings(start);
     let mut statistics = WorkerStatistics::new(&settings.timing);
     statistics.connects = connections.len() as u64;
@@ -279,6 +282,7 @@ pub fn work<P: Poller, C: Clock>(
     let cpu_end = cpu_end.unwrap_or_else(os::thread_cpu_time);
     statistics.cpu = cpu_end.saturating_sub(cpu_start.unwrap_or(cpu_end));
     Some(WorkerResult {
+        affinity,
         statistics,
         connections: connections
             .iter()

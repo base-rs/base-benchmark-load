@@ -18,7 +18,7 @@ Load:
   --rate N                   Offered requests per second in rate mode, such as 240000 or 240k (required there).
   --cpus LIST                Pin one worker to each CPU, such as 2,3,6-7.
   --workers N                Unpinned workers, when --cpus is not given [1].
-  --controller-cpu N         Pin the controlling thread.
+  --controller-cpu N         Pin the controlling thread to a CPU of its own, not one of --cpus.
   --warmup DURATION          Load before the measured window [1s]. Durations take ns, us, ms, s, or m; a bare number is seconds.
   --duration DURATION        The measured window [5s].
   --timeout DURATION         The longest wait for a response after its send [10s].
@@ -313,6 +313,11 @@ impl Options {
             (Mode::Rate, None) => return Err(invalid("rate mode needs --rate")),
             (Mode::Closed, Some(_)) => return Err(invalid("--rate applies only to rate mode")),
             _ => {}
+        }
+        if let Some(cpu) = self.controller_cpu.filter(|cpu| self.cpus.contains(cpu)) {
+            return Err(invalid(format!(
+                "--controller-cpu {cpu} is also a worker's CPU in --cpus; the controller needs a CPU of its own"
+            )));
         }
         if self.connections < self.workers {
             return Err(invalid(format!(

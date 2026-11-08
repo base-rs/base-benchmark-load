@@ -30,6 +30,7 @@ fn report(
             fill(index, &mut statistics, &mut connection);
             WorkerReport {
                 cpu: Some(index + 2),
+                affinity: vec![index + 2],
                 statistics,
                 connections: vec![connection, ConnectionCounters::default()],
             }
@@ -183,6 +184,7 @@ fn open_loop_records() {
     let extension = &record.extensions[EXTENSION];
     assert_eq!(extension["planned"], 10);
     assert_eq!(extension["workers"][1]["cpu"], 3);
+    assert_eq!(extension["workers"][1]["affinity"], json!([3]));
     assert_eq!(extension["intervals"][0]["latency_count"], 8);
     assert_eq!(extension["intervals"][1]["offset_ns"], 5 * MS);
     assert_eq!(extension["fairness"]["connection_completions"]["zero"], 2);
