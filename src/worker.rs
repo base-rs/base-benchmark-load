@@ -84,7 +84,7 @@ impl Load<'_> {
 /// The value of [`Start`]'s instant when the run is abandoned before it starts.
 const ABORT: u64 = u64::MAX;
 
-/// Starts every worker at the same instant, once all have connected.
+/// Starts every worker at the same instant, once all have connected. The workers and the controller meet twice: once when every worker has set up, and again when the controller has decided the start or abandoned the run. The start lies far enough ahead that every worker is waiting for it when it arrives.
 #[derive(Debug)]
 pub struct Start {
     barrier: Barrier,
@@ -110,12 +110,10 @@ impl Start {
                 .get_or_insert(error);
         }
         self.barrier.wait();
-        loop {
-            match self.instant.load(Ordering::Acquire) {
-                0 => std::hint::spin_loop(),
-                ABORT => return None,
-                start => return Some(start),
-            }
+        self.barrier.wait();
+        match self.instant.load(Ordering::Acquire) {
+            ABORT => None,
+            start => Some(start),
         }
     }
 
@@ -128,9 +126,10 @@ impl Start {
             .take()
     }
 
-    /// Start the workers at `start`, which is positive.
+    /// Start the workers at `start`, once [`Start::wait_for_workers`] has returned. Call it, or [`Start::abort`], exactly once.
     pub fn publish(&self, start: u64) {
         self.instant.store(start, Ordering::Release);
+        self.barrier.wait();
     }
 
     pub fn abort(&self) {

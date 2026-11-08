@@ -2,8 +2,17 @@
 // Copyright, 2026, by Samuel Williams.
 
 use super::*;
-use crate::{clock::MonotonicClock, poller::Epoll, statistics::Period};
-use std::{net::TcpListener, num::NonZeroU64, os::fd::RawFd};
+use crate::{
+    clock::{MonotonicClock, StepClock},
+    poller::Epoll,
+    statistics::Period,
+};
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+    num::NonZeroU64,
+    os::fd::RawFd,
+};
 
 const MS: u64 = 1_000_000;
 
@@ -121,6 +130,58 @@ fn the_start_waits_for_every_worker() {
             (None, None)
         );
     });
+}
+
+/// A whole worker run on a clock that advances only as it is read, against a server that accepts but never answers. Every instant comes from the clock, so each part of the loop runs whatever the real timing, including the wait for a start ahead of it.
+#[test]
+fn a_worker_runs_on_its_clock_from_the_start_to_the_drain() {
+    let fixture = Fixture::new();
+    let listener = listener();
+    let load = fixture.closed(listener.local_addr().unwrap());
+    let clock = StepClock::new(0, 10_000);
+    let start = Start::new(1);
+    let result = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| work(&load, 0, Epoll::new(), &clock, &start));
+        assert!(start.wait_for_workers().is_none());
+        start.publish(clock.now() + 10 * MS);
+        worker.join().unwrap().unwrap()
+    });
+    let statistics = &result.statistics;
+    // The one request, sent at the start and never answered, timed out after the window, in its drain, and the connection did not reconnect.
+    assert_eq!((statistics.sent, statistics.sent_in_window), (1, 1));
+    assert_eq!(
+        statistics.period(Period::Drain).errors[ErrorKind::Timeout as usize],
+        1
+    );
+    assert_eq!(statistics.finished(), 1);
+    assert_eq!((statistics.connects, statistics.disconnects), (1, 1));
+    assert!(statistics.iterations > 0);
+    assert_eq!(result.connections.len(), 1);
+    assert_eq!(result.affinity, os::affinity());
+}
+
+/// The open loop on the same clock: its ten requests fall due in the window, while the worker is busy sending them, and each times out unanswered, so the connection reconnects, on the event that completes it, to send the next.
+#[test]
+fn an_open_loop_worker_runs_its_schedule_on_its_clock() {
+    let fixture = Fixture::new();
+    let listener = listener();
+    let mut load = fixture.load(listener.local_addr().unwrap(), 1);
+    load.timeout = 2 * MS;
+    let clock = StepClock::new(0, 10_000);
+    let start = Start::new(1);
+    let result = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| work(&load, 0, Epoll::new(), &clock, &start));
+        assert!(start.wait_for_workers().is_none());
+        start.publish(clock.now() + MS);
+        worker.join().unwrap().unwrap()
+    });
+    let statistics = &result.statistics;
+    let measured = statistics.period(Period::Measured);
+    assert_eq!(measured.errors[ErrorKind::Timeout as usize], 10);
+    assert_eq!(statistics.finished(), 10);
+    assert_eq!(statistics.sent, 10);
+    assert_eq!((statistics.connects, statistics.disconnects), (10, 10));
+    assert!(statistics.busy > 0);
 }
 
 #[test]
@@ -292,6 +353,152 @@ fn sends_to_a_reset_connection_fail() {
         1
     );
     assert!(matches!(connection.state, State::Down { .. }));
+}
+
+/// Wait until `stream` reports any of `events`; the timeout is only a watchdog.
+fn wait_for(stream: &TcpStream, events: libc::c_short) {
+    let mut descriptor = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    // SAFETY: One valid descriptor.
+    assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 10_000) }, 1);
+}
+
+/// A connection, registered with `poller`, that started connecting to `address` at 0.
+fn connecting(address: SocketAddr, poller: &mut Epoll) -> Connection<TcpStream> {
+    let mut connection = Connection::new(0);
+    let stream = os::connect(address).unwrap();
+    poller.add(stream.as_raw_fd(), 0).unwrap();
+    connection.connecting(stream, 0);
+    connection
+}
+
+impl Fixture {
+    /// A closed loop of one connection, whose window is from 1 ms to 11 ms when it starts at 1 ms.
+    fn closed(&self, address: SocketAddr) -> Load<'_> {
+        Load {
+            schedule: None,
+            ..self.load(address, 1)
+        }
+    }
+}
+
+const WRITABLE: Event = Event {
+    token: 0,
+    readable: false,
+    writable: true,
+    closed: false,
+};
+
+#[test]
+fn a_reconnection_completes_on_its_event_and_sends_at_once() {
+    let fixture = Fixture::new();
+    let listener = listener();
+    let address = listener.local_addr().unwrap();
+    let mut poller = Epoll::new().unwrap();
+    let load = fixture.closed(address);
+    let settings = load.settings(MS);
+    let mut statistics = WorkerStatistics::new(&settings.timing);
+    let mut connection = connecting(address, &mut poller);
+    let (mut accepted, _) = listener.accept().unwrap();
+    wait_for(connection.stream.as_ref().unwrap(), libc::POLLOUT);
+    let clock = StepClock::new(2 * MS, 0);
+    handle(
+        &mut connection,
+        &mut poller,
+        &WRITABLE,
+        &clock,
+        0,
+        &settings,
+        &mut statistics,
+    );
+    assert_eq!(connection.state, State::Open);
+    assert_eq!((statistics.connects, statistics.sent), (1, 1));
+    let mut request = vec![0; fixture.request.bytes.len()];
+    accepted.read_exact(&mut request).unwrap();
+    assert_eq!(request, fixture.request.bytes);
+}
+
+#[test]
+fn a_refused_reconnection_fails_on_its_event() {
+    let fixture = Fixture::new();
+    let (_socket, address) = crate::os::refusing();
+    let mut poller = Epoll::new().unwrap();
+    let load = fixture.closed(address);
+    let settings = load.settings(MS);
+    let mut statistics = WorkerStatistics::new(&settings.timing);
+    let mut connection = connecting(address, &mut poller);
+    wait_for(connection.stream.as_ref().unwrap(), libc::POLLOUT);
+    handle(
+        &mut connection,
+        &mut poller,
+        &Event {
+            closed: true,
+            ..WRITABLE
+        },
+        &StepClock::new(2 * MS, 0),
+        0,
+        &settings,
+        &mut statistics,
+    );
+    assert_eq!(connection.state, State::Down { until: 3 * MS });
+    assert!(connection.stream.is_none());
+    assert_eq!((statistics.connect_errors, statistics.sent), (1, 0));
+}
+
+/// The events of an open connection, scripted rather than polled, so that each of `handle`'s branches runs whatever the timing: an event that only reports room to write sends without reading, and one that only reports the peer's close still reads, which finds the end of the stream.
+#[test]
+fn open_connections_read_only_when_readable_or_closed() {
+    let fixture = Fixture::new();
+    let listener = listener();
+    let address = listener.local_addr().unwrap();
+    let mut poller = Epoll::new().unwrap();
+    let load = fixture.closed(address);
+    let settings = load.settings(MS);
+    let mut statistics = WorkerStatistics::new(&settings.timing);
+    let mut connection = connecting(address, &mut poller);
+    let (accepted, _) = listener.accept().unwrap();
+    wait_for(connection.stream.as_ref().unwrap(), libc::POLLOUT);
+    connection.connected(0, &mut statistics);
+    // The server's response is waiting, but a writable event does not read it.
+    (&accepted)
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        .unwrap();
+    wait_for(connection.stream.as_ref().unwrap(), libc::POLLIN);
+    let clock = StepClock::new(2 * MS, 0);
+    handle(
+        &mut connection,
+        &mut poller,
+        &WRITABLE,
+        &clock,
+        0,
+        &settings,
+        &mut statistics,
+    );
+    assert_eq!((statistics.sent, statistics.bytes_read), (1, 0));
+    assert_eq!(connection.in_flight.len(), 1);
+    // The server closes: an event reporting only the close reads the response, then the end of the stream, which fails the connection.
+    drop(accepted);
+    wait_for(connection.stream.as_ref().unwrap(), libc::POLLRDHUP);
+    handle(
+        &mut connection,
+        &mut poller,
+        &Event {
+            writable: false,
+            closed: true,
+            ..WRITABLE
+        },
+        &clock,
+        0,
+        &settings,
+        &mut statistics,
+    );
+    let measured = statistics.period(Period::Measured);
+    assert_eq!(measured.valid, 1);
+    assert_eq!(statistics.disconnects, 1);
+    assert_eq!(connection.state, State::Down { until: 3 * MS });
 }
 
 #[test]
