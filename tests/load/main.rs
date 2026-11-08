@@ -3,7 +3,7 @@
 
 //! Runs against a small in-test server. Assertions are on counts, validation, and causality: a latency at least as long as a stall the server imposed, never an upper bound on how fast anything ran.
 //!
-//! No assertion depends on how much happened in a short time. An open loop ends once every planned request has an outcome, so its counts are exact however slowly it ran; the response and drain timeouts stay at their defaults of seconds, as watchdogs, unless a test is about them, and then it asserts only what the timeout causes. A closed loop sends only in its window, so the tests that need a request sent or a valid response in one use [`CLOSED_WINDOW`]; those with a shorter window assert only what holds when nothing was sent.
+//! No assertion depends on how much happened in a short time. An open loop ends once every planned request has an outcome, so its counts are exact however slowly it ran; the response, connect, and drain timeouts are minutes long, as [`WATCHDOGS`], unless a test is about them, and then it asserts only what the timeout causes. A closed loop sends only in its window, so the tests that need a request sent or a valid response in one use [`CLOSED_WINDOW`]; those with a shorter window assert only what holds when nothing was sent.
 
 mod closed;
 mod command;
@@ -30,7 +30,17 @@ pub fn options(arguments: &[&str]) -> Options {
     }
 }
 
-/// Run `mode` against `address` with `arguments`, quietly.
+/// The response, connect, and drain timeouts of every run, unless its arguments give their own: only watchdogs, so that a run starved of CPU, as on one CPU shared with dozens of busy processes, still gives every request an outcome before they expire. The options' defaults of 10 to 15 seconds are not enough there.
+const WATCHDOGS: [&str; 6] = [
+    "--timeout",
+    "300s",
+    "--connect-timeout",
+    "300s",
+    "--drain-timeout",
+    "300s",
+];
+
+/// Run `mode` against `address` with `arguments`, quietly, and with [`WATCHDOGS`] for the timeouts the arguments do not give.
 pub fn load(
     mode: &str,
     address: std::net::SocketAddr,
@@ -38,6 +48,8 @@ pub fn load(
 ) -> std::io::Result<Report> {
     let address = address.to_string();
     let mut all = vec![mode, "--address", &address];
+    // Later arguments override earlier ones.
+    all.extend_from_slice(&WATCHDOGS);
     all.extend_from_slice(arguments);
     run(&options(&all))
 }
