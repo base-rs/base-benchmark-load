@@ -132,4 +132,49 @@ pub fn clock_source() -> Option<String> {
 }
 
 #[cfg(test)]
+/// A loopback address that refuses connections: a socket bound to a free port that never listens, which also keeps the port from being reused while it lives.
+pub fn refusing() -> (OwnedFd, SocketAddr) {
+    // SAFETY: `socket` returns a new descriptor, owned by nothing else, which is checked below.
+    let socket = unsafe {
+        OwnedFd::from_raw_fd(libc::socket(
+            libc::AF_INET,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+        ))
+    };
+    let mut inet = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(std::net::Ipv4Addr::LOCALHOST).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    let mut length = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: `inet` is a valid IPv4 socket address of `length` bytes, for both calls.
+    unsafe {
+        assert_eq!(
+            libc::bind(
+                std::os::fd::AsRawFd::as_raw_fd(&socket),
+                (&raw const inet).cast(),
+                length
+            ),
+            0
+        );
+        assert_eq!(
+            libc::getsockname(
+                std::os::fd::AsRawFd::as_raw_fd(&socket),
+                (&raw mut inet).cast(),
+                &mut length
+            ),
+            0
+        );
+    }
+    (
+        socket,
+        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, u16::from_be(inet.sin_port))),
+    )
+}
+
+#[cfg(test)]
 mod tests;

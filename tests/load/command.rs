@@ -83,17 +83,14 @@ fn runs_write_one_record_and_a_summary() {
         "--fail-on",
         "invalid,errors",
     ]);
-    assert!(output.status.success());
+    assert!(output.status.success(), "{}", text(&output.stderr));
     assert!(output.stderr.is_empty());
 }
 
 #[test]
 fn runs_that_cannot_start_fail_without_a_record() {
-    let address = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .to_string();
+    let (_socket, address) = super::server::refusing();
+    let address = address.to_string();
     let output = command(&["closed", "--address", &address]);
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());

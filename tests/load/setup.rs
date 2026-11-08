@@ -37,10 +37,7 @@ fn unresolvable_addresses() {
 
 #[test]
 fn refused_preflights() {
-    let address = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    let (_socket, address) = super::server::refusing();
     let error = load("closed", address, &[]).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
     contains(&error, &format!("preflight request to {address}"));

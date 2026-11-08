@@ -126,7 +126,7 @@ fn the_start_waits_for_every_worker() {
 #[test]
 fn workers_that_fail_to_set_up_return_nothing() {
     let fixture = Fixture::new();
-    let address = listener().local_addr().unwrap();
+    let (_socket, address) = crate::os::refusing();
     let load = fixture.load(address, 1);
     let start = Start::new(1);
     std::thread::scope(|scope| {
@@ -187,7 +187,7 @@ fn connecting_reports_registration_failures() {
 #[test]
 fn connecting_reports_refusals() {
     let fixture = Fixture::new();
-    let address = listener().local_addr().unwrap();
+    let (_socket, address) = crate::os::refusing();
     let load = fixture.load(address, 1);
     let error = connect(
         &load,

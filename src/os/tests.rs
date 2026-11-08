@@ -69,10 +69,7 @@ fn connects_without_blocking() {
 #[test]
 fn connection_failures_are_reported() {
     // A loopback port that nothing listens on: the refusal arrives immediately or as the socket's error.
-    let address = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    let (_socket, address) = refusing();
     match connect(address) {
         Ok(stream) => {
             stream.set_nonblocking(false).unwrap();

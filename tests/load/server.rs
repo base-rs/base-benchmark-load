@@ -6,7 +6,7 @@
 use std::{
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -55,7 +55,7 @@ impl Server {
         Self::with_accept_limit(usize::MAX, behaviour)
     }
 
-    /// A server that stops listening after `limit` connections, so that later connections are refused.
+    /// A server that stops listening once it accepts its `limit`th connection, before serving it, so that every later connection is refused.
     pub fn with_accept_limit(
         limit: usize,
         behaviour: impl Fn(Arrival) -> Action + Send + Sync + 'static,
@@ -68,12 +68,19 @@ impl Server {
         let accept = {
             let (stop, requests) = (stop.clone(), requests.clone());
             std::thread::spawn(move || {
+                let mut listener = Some(listener);
                 for connection in 0..limit {
-                    let Ok((stream, _)) = listener.accept() else {
+                    let Ok((stream, _)) = listener.as_ref().unwrap().accept() else {
                         break;
                     };
                     if stop.load(Ordering::Acquire) {
                         break;
+                    }
+                    if connection + 1 == limit {
+                        // Stop listening before serving the last connection, so that any connection attempted after its first response is refused. Shut the socket down rather than only closing it: a process spawned concurrently by another test may briefly hold a duplicate of the descriptor, which would keep it listening.
+                        let listening = listener.take().unwrap();
+                        // SAFETY: The descriptor is open.
+                        unsafe { libc::shutdown(listening.as_raw_fd(), libc::SHUT_RDWR) };
                     }
                     let (behaviour, requests) = (behaviour.clone(), requests.clone());
                     std::thread::spawn(move || serve(stream, connection, &*behaviour, &requests));
@@ -183,4 +190,48 @@ fn reset(stream: &TcpStream) {
             std::mem::size_of::<libc::linger>() as libc::socklen_t,
         );
     }
+}
+
+/// A loopback address that refuses connections: a socket bound to a free port that never listens, which also keeps the port from being reused while it lives.
+pub fn refusing() -> (OwnedFd, SocketAddr) {
+    // SAFETY: `socket` returns a new descriptor, owned by nothing else, which is checked below.
+    let socket = unsafe {
+        OwnedFd::from_raw_fd(libc::socket(
+            libc::AF_INET,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+        ))
+    };
+    let mut inet = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(std::net::Ipv4Addr::LOCALHOST).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    let mut length = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: `inet` is a valid IPv4 socket address of `length` bytes, for both calls.
+    unsafe {
+        assert_eq!(
+            libc::bind(
+                std::os::fd::AsRawFd::as_raw_fd(&socket),
+                (&raw const inet).cast(),
+                length
+            ),
+            0
+        );
+        assert_eq!(
+            libc::getsockname(
+                std::os::fd::AsRawFd::as_raw_fd(&socket),
+                (&raw mut inet).cast(),
+                &mut length
+            ),
+            0
+        );
+    }
+    (
+        socket,
+        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, u16::from_be(inet.sin_port))),
+    )
 }
