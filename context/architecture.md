@@ -5,7 +5,7 @@
 | Module | Responsibility |
 | --- | --- |
 | `options` | The command line: named options with durations (`250ms`, `1.5s`) and rates (`240k`), validated together before anything runs. |
-| `run` | The controller: resolves the address, builds the request, runs the preflight, raises the descriptor limit, spawns one worker per CPU, starts them together, measures the window with `base_benchmark::Interval`, and assembles the report. |
+| `run` | The controller: resolves the address, builds the request, runs the preflight, raises the descriptor limit, spawns one worker per CPU, pins itself once they exist, so that unpinned workers do not inherit its CPU, starts them together, measures the window with `base_benchmark::Interval`, and assembles the report. |
 | `worker` | One thread's event loop: pins itself, connects its connections, busy-polls, sends on the schedule or in a closed loop, times out and reconnects, and stops when every request has an outcome. |
 | `connection` | One connection's state machine, generic over its stream so tests can script it: queueing and writing requests, reading and completing responses, and failing every outstanding request with the connection's failure. |
 | `response` | Incremental response framing and validation: heads through `httparse`, bodies by length, chunks, or close, compared with the expected body or whole response as they arrive. |
@@ -26,7 +26,7 @@ Sockets are registered edge-triggered for reading, writing, and closing, once. A
 
 ## Timing and periods
 
-The controller publishes a start 100 ms after every worker has connected, so all see it in time. The warmup and window follow from it: `[start, start + warmup)` and `[start + warmup, start + warmup + duration)`. The drain deadline is `--drain-timeout` after the window. Rate-mode outcomes belong to the period of their planned time, closed-mode outcomes to the period they happen in.
+The controller and the workers meet at a barrier twice: once every worker has pinned itself and connected, and again once the controller has published the start, or abandoned the run because a worker or the controller failed to set up. The start is 100 ms after the first meeting, so every worker is waiting for it when it arrives. The warmup and window follow from it: `[start, start + warmup)` and `[start + warmup, start + warmup + duration)`. The drain deadline is `--drain-timeout` after the window. Rate-mode outcomes belong to the period of their planned time, closed-mode outcomes to the period they happen in.
 
 ## Window markers
 

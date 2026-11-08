@@ -48,6 +48,11 @@ pub use statistics::{
 
 use std::{io::Write, process::ExitCode};
 
+/// The usage guide's examples, compiled as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../context/usage.md")]
+struct UsageGuide;
+
 /// Run the command line `arguments`, without the program name: write the record to `out`, and the summary and errors to `errors`.
 ///
 /// Exits unsuccessfully, without a record, when the options are invalid, the run cannot start, a `--fail-on` class occurred, or there is nothing to report.
