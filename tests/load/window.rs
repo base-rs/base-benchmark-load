@@ -11,6 +11,7 @@ use base_benchmark::{
     CONTROL_STDIO, CONTROL_VARIABLE, Measurement, ProcessRecord, WINDOW_START, WINDOW_STARTED,
     WINDOW_STOP, Window,
 };
+use base_benchmark_load::Period;
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
     process::{Command, Stdio},
@@ -309,7 +310,7 @@ fn rate_mode_marks_the_stop_once_every_request_has_an_outcome() {
     );
 }
 
-/// In the closed loop, whose window counts the outcomes that happen in it, the stop is marked when the window ends, without waiting for the drain: the server holds its response to the first request of one of two connections until the runner has taken its snapshot at the stop, and the run then drains it.
+/// In the closed loop, whose window counts the outcomes that happen in it, the stop is marked when the window ends, without waiting for the drain: the server holds its response to the first request of one of two connections until the runner has taken its snapshot at the stop, and the run then drains it, with a valid response. A stop marked only after the drain would hold that response until the drain deadline failed the request, so the drain's 30-second timeout is only the watchdog that turns that hang into a failure, sooner than [`WATCHDOGS`] would.
 #[test]
 fn the_closed_loop_marks_the_stop_when_the_window_ends() {
     let log = Log::default();
@@ -338,11 +339,22 @@ fn the_closed_loop_marks_the_stop_when_the_window_ends() {
             "0",
             "--duration",
             CLOSED_WINDOW,
+            "--drain-timeout",
+            "30s",
             "--quiet",
         ],
         Some(&mut window),
     )
     .unwrap();
+    // The held request was in flight at the window's end, and drained with a valid response, as was any of the other connection's.
+    let drain = report.statistics().period(Period::Drain);
+    assert!(drain.valid >= 1, "{}", report.summary());
+    assert_eq!(
+        (drain.invalid_total(), drain.error_total()),
+        (0, 0),
+        "{}",
+        report.summary()
+    );
     // The other connection's valid responses in the window make a record.
     let record = report.record().unwrap();
     let log = log.lock().unwrap();
