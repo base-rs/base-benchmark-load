@@ -55,6 +55,7 @@ fn report(
         starved_limit: 0.25,
         connection_details: false,
         preflight_requests: 1,
+        markers: None,
         context: json!({"version": "test"}),
     }
 }

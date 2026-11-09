@@ -46,7 +46,7 @@ Every request has exactly one outcome:
 - **invalid**, by the first check it fails: `status`, a required `header`, the `body`, or the whole `response` (`--response-file`);
 - **failed**, by kind: `write`, `read`, `reset`, `eof` (the server closed before the response was complete), `timeout` (no response within `--timeout` of the send, or still outstanding at the drain deadline), `parse` (an unframeable response, or bytes nobody asked for), `closed` (an earlier response closed the connection: it said `Connection: close`, or its body was delimited by the close), or `unsent` (planned, never sent before the drain deadline).
 
-A failure closes the connection and charges every request outstanding on it; the connection reconnects after `--reconnect-delay` and the run continues. Failed connection attempts are counted separately, as attempts. Invalid responses are complete responses, so their connections stay open, but they are never in the distributions. `base-benchmark` should treat a record with invalid responses as making a comparison invalid; `--fail-on invalid,errors,saturated,starved` exits unsuccessfully, without a record, instead.
+A failure closes the connection and charges every request outstanding on it; the connection reconnects after `--reconnect-delay` and the run continues. Failed connection attempts are counted separately, as attempts. Invalid responses are complete responses, so their connections stay open, but they are never in the distributions. A `base-benchmark` scenario that declares `invalid-responses = "responses_invalid"` treats a record with invalid responses as making its comparisons invalid; `--fail-on invalid,errors,saturated,starved` exits unsuccessfully, without a record, instead.
 
 Outcomes belong to **periods**: in rate mode by the planned time, so the measured cohort is exact; in closed mode by when the outcome happened, so warmup, window, and drain are separate.
 
@@ -125,13 +125,60 @@ The sample covers the window. Its metrics are:
 
 `base-benchmark` divides the measured counts by the operations, so they read per valid response: `errors` is errors per success, and `requests_planned` the planned requests per success. Only properties of the server have a direction. Lower is better for `wall_time`, which per success is the inverse of the throughput; the `latency`, `round_trip`, `send_delay`, and `service_time` distributions, since a request waits to be sent mostly behind a slow response; `responses_invalid` and `invalid_KIND`; `errors` and `errors_KIND`; `connect_errors`; and `connections_starved`, `connections_starved_fraction`, `starved_span_max`, and `response_wait_max`, since a server that starves connections is worse whatever its throughput. Every other metric is a diagnostic of the client, and neutral: the controller's `cpu_time`, `user_cpu_time`, `system_cpu_time`, and context switches, which measure this process; the `dispatch_lag` and `schedule_lag` distributions; `responses_valid` and `requests_planned`; the counts in the window and the shortfalls; `drain_time`; `client_saturated`; `worker_busy_time_max`; and the connection completions. In the closed loop a faster server makes the client busier, so read saturation as a reason to distrust a result, not as a difference between servers.
 
-The `base-benchmark-load` extension holds the context (version, clock source, address, CPUs, and the descriptor limit in effect), `preflight_requests`, the requests sent before the load, which have no outcome, so a server's own request count is the sum of every period's outcomes and these; the outcomes of every period, connection counts, bytes, fairness (minimum, median, maximum, mean, coefficient of variation, Jain's index, and zeros, of completions per connection, mean latency per connection, and completions per worker), the saturation reasons and the limits that judged them, `starvation` (the connections, the starved ones, by each criterion as `unanswered` and `long_span`, those starved only in the drain as `drain_only`, their fraction, the `limit` and `span_limit_ns`, `span_max_ns`, `wait_max_ns`, `wait_max_unanswered`, and the reason, or null), the shortfall, its parts, and `held_back`, the reason the connections or the server held requests back, or null, each worker's CPU, the CPUs it could run on, busy fraction, CPU time, its CPU's software interrupt time, and 99th percentile dispatch and schedule lag, per-interval completions and latency quantiles (`--interval`), the full histograms as `[lowest value, count]` buckets with their precision, and with `--connection-details`, every connection's counters, including its requests planned in the window (rate mode), whether it was starved, and only in the drain, its longest starved span and that span's part in the window, and its longest wait.
+The `base-benchmark-load` extension holds the context (version, clock source, address, CPUs, and the descriptor limit in effect), the [`window`](#the-measured-window) markers' timing under the runner, or null, `preflight_requests`, the requests sent before the load, which have no outcome, so a server's own request count is the sum of every period's outcomes and these; the outcomes of every period, connection counts, bytes, fairness (minimum, median, maximum, mean, coefficient of variation, Jain's index, and zeros, of completions per connection, mean latency per connection, and completions per worker), the saturation reasons and the limits that judged them, `starvation` (the connections, the starved ones, by each criterion as `unanswered` and `long_span`, those starved only in the drain as `drain_only`, their fraction, the `limit` and `span_limit_ns`, `span_max_ns`, `wait_max_ns`, `wait_max_unanswered`, and the reason, or null), the shortfall, its parts, and `held_back`, the reason the connections or the server held requests back, or null, each worker's CPU, the CPUs it could run on, busy fraction, CPU time, its CPU's software interrupt time, and 99th percentile dispatch and schedule lag, per-interval completions and latency quantiles (`--interval`), the full histograms as `[lowest value, count]` buckets with their precision, and with `--connection-details`, every connection's counters, including its requests planned in the window (rate mode), whether it was starved, and only in the drain, its longest starved span and that span's part in the window, and its longest wait.
 
 Histograms have three significant digits, with HdrHistogram's bucketing: a quantile is the highest value of the bucket holding it, clamped to the exact minimum and maximum. Merging per-worker histograms is exact.
 
 ## With `base-benchmark`
 
-Until `base-benchmark` has roles, run the server yourself and use the record directly, or wrap both in a project-owned workload. Since the address is not a parameter, records against servers on different ports compare. Once roles exist, `base-benchmark-load` is the driver role: the service's ready line gives `{server.address}`, the role's CPU set gives `--cpus`, and the record becomes the sample. Window markers, which tell the runner when the measured window starts and ends, are not implemented yet; the controller marks the place in [the architecture](architecture.md).
+`base-benchmark-load` is the driver role of `base-benchmark` multi-process scenarios, from `base-benchmark` 0.4: the server is a service whose ready line gives its address, and the client's record is the sample. Install it at a pinned version as an external program, and give its path to every run:
+
+```sh
+cargo install --locked --root tools base-benchmark-load@VERSION
+base-benchmark run hello --artifacts target/base-benchmark/prepared-TIME/artifacts.json --program load=tools/bin/base-benchmark-load --role-cpus client=1,5 --role-cpus server=2,3
+```
+
+```toml
+[[package.metadata.base-benchmark.scenario]]
+name = "hello"
+
+[[package.metadata.base-benchmark.scenario.role]]
+name = "server"
+kind = "service"
+subject = true
+ready = "listening on {address}"
+
+[[package.metadata.base-benchmark.scenario.role]]
+name = "client"
+kind = "driver"
+external = "load"
+invalid-responses = "responses_invalid"
+arguments = ["rate", "--address", "{server.address}", "--rate", "100k", "--connections", "64", "--cpus", "1", "--controller-cpu", "5"]
+smoke-arguments = ["--warmup", "100ms", "--duration", "200ms"]
+measure-arguments = ["--warmup", "2s", "--duration", "8s"]
+```
+
+- **Invalid responses.** Declare `invalid-responses = "responses_invalid"`: it is the record's total of the measured period's responses that failed validation, which `base-benchmark` requires of the driver, so that a screening campaign reports comparisons with any as invalid and a recorded one fails. Leave `invalid` out of `--fail-on` here, since without a record the sample fails instead. The operations are the valid responses only, and errors are ordinary metrics, per success.
+- **Placement.** `--role-cpus client=...` confines the whole process; `--cpus` and `--controller-cpu` then pin the workers and the controller to CPUs within it, which the role's CPU set must include.
+- **Parameters.** The address comes from the server's ready line, and is not a parameter, so every sample's record has the same parameters.
+
+### The measured window
+
+Under the runner, which sets `BASE_BENCHMARK_CONTROL=stdio` in the driver's environment, the controller marks the measured window with [`base_benchmark::Window`](https://docs.rs/base-benchmark/0.4.0/base_benchmark/struct.Window.html): it writes `base-benchmark window start` to stdout and waits for the runner's acknowledgement on stdin, which the runner sends once it has snapshotted every service's CPU time, then writes `base-benchmark window stop` once the window's requests are done with, as below, and only then the record. The runner measures the services' CPU between the two, which summaries divide by the operations as CPU per request. Outside the runner the variable is unset, nothing is marked, stdin is never read, and the record is all that goes to stdout. A `BASE_BENCHMARK_CONTROL` this version does not support fails the run.
+
+The start is acknowledged before the window starts, so the services' snapshot precedes every request the window counts in rate mode, all of them planned in it. In the closed loop the window counts the outcomes that happen in it, and the requests in flight across its start, at most `--depth` per connection, were sent during the warmup. Such a request is counted yet reached the server before the snapshot only if it was outstanding for longer than the time from the acknowledgement to the window's start, `acknowledged_before_ns`, about the lead; with the start marked before the load, as below, none can be. That is part of the approximation at the window's edges. Every worker starts at one instant, 100 ms after the controller decides the load's start, so:
+
+- with `--window-lead` at least as long as `--warmup`, as with no warmup, the start is marked once every worker has connected, and the load's start is decided only once it is acknowledged, so every worker starts 100 ms after the acknowledgement and no request of the run, warmup or window, precedes the services' snapshot. The services' window then also covers the warmup;
+- otherwise, the load starts first, 100 ms after every worker has connected, and the start is marked `--window-lead` (100 ms) before the window, during the warmup. The services' window then covers that much of the warmup's load too, about 1% of an 8-second window, at the window's rate. If the acknowledgement arrives after the window has started, as on a host so busy that the runner or the controller is delayed by longer than the lead, the run fails once its requests have outcomes, without a record, and says how late it was: the services' snapshot may then follow counted requests. Lengthen the lead for such a host, or shorten it on an idle measuring host to tighten the window's edge. [An evaluation](../results/2026-11-09-aiko-window/readme.md) on a busy desktop found acknowledgements of 37 µs to 3.3 ms, and a 10 ms lead failed one sample of two.
+
+The runner snapshots the services at the stop without delaying the client. Where the stop is marked follows what each mode counts:
+
+- in rate mode, which counts the requests planned in the window, the stop is marked once every request has an outcome, after the drain. A request planned in the window may be sent after it, when the client lags, or served after it, when the server falls behind; its server CPU is then in the services' window too, rather than left out exactly when the server is overloaded, which would understate `server/cpu_time_per_operation`. Nothing is planned after the window, so the drain adds the server work of no other requests but any of the warmup's still outstanding, and a drain spent waiting, as for requests that time out, adds only what the services spend while idle. Requests that fail, such as by timing out, are not operations, and the server work they cost is in the window, which is why `base-benchmark` labels CPU per request approximate;
+- in the closed loop, which counts the outcomes that happen in the window, the stop is marked when the controller wakes at the window's end, with the controller's own interval. The requests in flight then are drained but not counted, and the server work they had before the stop is in the services' window, as at its start.
+
+The record's `window` extension says when the markers were sent: `lead_ns`, `before_start`, whether the start was marked before the load started, `acknowledgement_ns`, from the start marker to its acknowledgement, `acknowledged_before_ns`, how long before the window's start it came, `stop_after_ns`, how long after the window's end the stop was marked, and `stop_after_drain`, whether that was once every request had an outcome, as in rate mode. It is null outside the runner. The summary says the same on a line of its own.
+
+Nothing else is written to stdout: `help` and `version` write lines that never begin `base-benchmark window`, and the record is one line of JSON. The summary and errors go to stderr.
 
 ## As a library
 
@@ -147,4 +194,4 @@ fn main() -> std::process::ExitCode {
 }
 ```
 
-The `base-benchmark-load` binary is this wrapper. To use the measurements without a record, parse the options with `Options::parse`, call `run`, and read the `Report`: its summary, its statistics, and its record.
+The `base-benchmark-load` binary is this wrapper, and under the runner marks the window on the process's stdout, so the wrapper must pass stdout as `out`. To use the measurements without a record, parse the options with `Options::parse`, call `run`, and read the `Report`: its summary, its statistics, and its record. `run_with_window` takes a `base_benchmark::Window` to mark the window with, as `command` does with `Window::from_environment()`.

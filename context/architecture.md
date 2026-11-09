@@ -5,7 +5,7 @@
 | Module | Responsibility |
 | --- | --- |
 | `options` | The command line: named options with durations (`250ms`, `1.5s`) and rates (`240k`), validated together before anything runs. |
-| `run` | The controller: resolves the address, builds the request, runs the preflight, raises the descriptor limit, spawns one worker per CPU, pins itself once they exist, so that unpinned workers do not inherit its CPU, starts them together, measures the window with `base_benchmark::Interval`, and assembles the report. |
+| `run` | The controller: resolves the address, builds the request, runs the preflight, raises the descriptor limit, spawns one worker per CPU, pins itself once they exist, so that unpinned workers do not inherit its CPU, starts them together, measures the window with `base_benchmark::Interval`, marks it for `base-benchmark`'s runner with `base_benchmark::Window`, and assembles the report. |
 | `worker` | One thread's event loop: pins itself, connects its connections, busy-polls, sends on the schedule or in a closed loop, times out and reconnects, and stops when every request has an outcome. |
 | `connection` | One connection's state machine, generic over its stream so tests can script it: queueing and writing requests, reading and completing responses, and failing every outstanding request with the connection's failure. |
 | `response` | Incremental response framing and validation: heads through `httparse`, bodies by length, chunks, or close, compared with the expected body or whole response as they arrive. |
@@ -38,11 +38,18 @@ The counters also follow the slot's starved span: when the open one began, the l
 
 ## Window markers
 
-`base-benchmark` roles will let the driver tell the runner when the window starts and ends, with a `start` marker acknowledged before the first counted request and a `stop` marker at the end. The controller is where they fit: it already wakes at both boundaries to start and stop its `Interval`. Since the rate-mode schedule is absolute, the `start` marker will have to be sent ahead of the window's start and acknowledged before it, or the window's start published after the acknowledgement; the closed loop can simply start counting after it.
+Under `base-benchmark`'s runner, `command` takes a `base_benchmark::Window` from the environment and `run_with_window` hands it to the controller, which alone writes the markers, on the process's stdout, and reads the acknowledgement from its stdin; the workers never touch either. Nothing else writes stdout before the record, which `command` writes only once `run_with_window` has returned, after the stop marker.
+
+The start marker must be acknowledged before the window starts, so before every request planned in it, and every outcome the closed loop's window counts, but the schedule is absolute from the start, which the controller publishes at the second meeting, so the window cannot wait for a late acknowledgement. The controller marks the start in one of two places:
+
+- when `--window-lead` is at least the warmup, right after the first meeting, when every worker has connected and waits for the start, and the services are idle. It publishes the start only once the acknowledgement has come, `START_LEAD` later, so every request of the run follows the snapshot causally. A failure here aborts the start, as a worker's failure to set up does, so no request is sent.
+- otherwise, after publishing the start, when it wakes `--window-lead` before the window's start. It then compares the time it read the acknowledgement with the window's start, and a later one fails the run. The workers are already running and have no way to stop early, so a failure after the start is published, including a marker that cannot be written or an acknowledgement that cannot be read, is returned only once every worker has finished and been joined; no stop is marked after one.
+
+In the closed loop, which counts the outcomes in the window, the stop is marked when the controller wakes at the window's end, before its `Interval` finishes. In rate mode, which counts the requests planned in the window, it is marked only once every worker has been joined, so every request has an outcome: the services' work for a request planned in the window but sent or served after it is then in their window, and since nothing is planned after the window, the drain holds no other requests' work but the warmup's stragglers. The report keeps when each marker was sent and acknowledged, on the run's clock, for the record's `window` extension and the summary.
 
 ## Not yet implemented
 
-- Window markers and record version 3 histogram measurements, which wait for `base-benchmark`.
+- Record version 3 histogram measurements, which wait for `base-benchmark`.
 - `pool` assignment of arrivals to any idle connection, Poisson arrivals, rate sweeps, and `hybrid` pacing that sleeps until shortly before the next due request.
 - Request templates beyond one fixed request, connection churn, TLS, HTTP/2, the echo protocol, io_uring, and platforms other than Linux.
 - A differential framing test against `base-http1`.

@@ -2,11 +2,11 @@
 
 An HTTP load generator for Base benchmarks: closed-loop maximum throughput, and open-loop fixed-rate latency measured from each request's intended send time.
 
-**Status:** the first milestone: HTTP/1.1 keep-alive with pipelining, closed and open loops, validation of every response, errors by kind, fairness, starved connection, and saturation reporting, and a `base-benchmark` record. Linux only. Window markers for `base-benchmark` roles, Poisson arrivals, rate sweeps, TLS, and HTTP/2 come later; see [the architecture](context/architecture.md).
+**Status:** the first milestone: HTTP/1.1 keep-alive with pipelining, closed and open loops, validation of every response, errors by kind, fairness, starved connection, and saturation reporting, a `base-benchmark` record, and window markers for the driver role of `base-benchmark` 0.4's multi-process scenarios. Linux only. Poisson arrivals, rate sweeps, TLS, and HTTP/2 come later; see [the architecture](context/architecture.md).
 
 ## Motivation
 
-Base compares its servers and schedulers with Tokio and Hyper. The client that drives those comparisons must be a fixed, neutral instrument: it must not share code with the subjects, must not hide server stalls through coordinated omission, and must report its own errors, invalid responses, and saturation next to its measurements, and the connections a server starves. Its results are `base-benchmark` process records, so it can act as the driver of `base-benchmark` campaigns.
+Base compares its servers and schedulers with Tokio and Hyper. The client that drives those comparisons must be a fixed, neutral instrument: it must not share code with the subjects, must not hide server stalls through coordinated omission, and must report its own errors, invalid responses, and saturation next to its measurements, and the connections a server starves. Its results are `base-benchmark` process records, and under `base-benchmark`'s runner it marks its measured window, so it can act as the driver of `base-benchmark` campaigns, whose services' CPU the runner measures over that window.
 
 ## Usage
 

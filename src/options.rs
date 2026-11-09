@@ -26,6 +26,7 @@ Load:
   --drain-timeout DURATION   How long requests still outstanding after the window may take [15s].
   --reconnect-delay DURATION The pause before reconnecting a failed connection [1ms].
   --interval DURATION        The length of the reported intervals within the window [1s].
+  --window-lead DURATION     Under base-benchmark's runner, mark the window's start this long before it; the runner must acknowledge it before the window starts, or the run fails. A lead at least as long as --warmup marks it before the load starts [100ms].
 
 Request:
   --method METHOD            [GET]
@@ -107,6 +108,8 @@ pub struct Options {
     pub drain_timeout: Duration,
     pub reconnect_delay: Duration,
     pub interval: Duration,
+    /// Under `base-benchmark`'s runner, how long before the window the controller marks its start, or, when it is at least the warmup, that the start is marked before the load starts.
+    pub window_lead: Duration,
     pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
@@ -133,7 +136,7 @@ pub enum Command {
 }
 
 /// The options that take a value.
-const VALUE_OPTIONS: [&str; 28] = [
+const VALUE_OPTIONS: [&str; 29] = [
     "--address",
     "--connections",
     "--depth",
@@ -148,6 +151,7 @@ const VALUE_OPTIONS: [&str; 28] = [
     "--drain-timeout",
     "--reconnect-delay",
     "--interval",
+    "--window-lead",
     "--method",
     "--path",
     "--header",
@@ -173,6 +177,9 @@ const DEFAULT_SHORTFALL_LIMIT: f64 = 0.001;
 /// The default `--starved-limit`: a quarter of the window. A fair server answers every connection at least once a round trip, so its starved spans stay near its round trip, which is under `--timeout` unless requests fail; only a fair server with a round trip a quarter of the window long, with at most four responses a connection in it, would reach it. A connection starved for longer has lost a quarter of its share of the window, and one starved at the window's end has a span that runs on through the drain. The limit is not tied to `--timeout`, whose default, 10 seconds, exceeds a typical window, so that partial starvation in it would go unreported.
 const DEFAULT_STARVED_LIMIT: f64 = 0.25;
 
+/// The default `--window-lead`, the same lead as the load's start has over the workers. On aiko, a shared desktop whose load average was 24 to 99 on 32 CPUs, the runner acknowledged 30 starts in 37 µs to 3.3 ms, while the controller woke up to 3.9 ms late; with a 10 ms lead, one start in two was acknowledged 5 ms after its window began. `results/2026-11-09-aiko-window` records them. The services' window takes in at most this much of the warmup's load, about 1% of an 8-second window, at the same rate as the window's, so CPU per request is inflated alike for every subject.
+const DEFAULT_WINDOW_LEAD: Duration = Duration::from_millis(100);
+
 /// The most reporting intervals a window may have; each needs a small histogram per worker.
 pub const INTERVAL_COUNT_LIMIT: u64 = 100_000;
 
@@ -195,6 +202,7 @@ impl Options {
             drain_timeout: Duration::from_secs(15),
             reconnect_delay: Duration::from_millis(1),
             interval: Duration::from_secs(1),
+            window_lead: DEFAULT_WINDOW_LEAD,
             method: "GET".to_owned(),
             path: "/".to_owned(),
             headers: Vec::new(),
@@ -280,6 +288,7 @@ impl Options {
                     duration(&value).map(|duration| options.reconnect_delay = duration)
                 }
                 "--interval" => duration(&value).map(|duration| options.interval = duration),
+                "--window-lead" => duration(&value).map(|duration| options.window_lead = duration),
                 "--method" => token(&name, value).map(|method| options.method = method),
                 "--path" => line(&name, value).map(|path| options.path = path),
                 "--header" => header(&value).map(|header| options.headers.push(header)),
@@ -354,9 +363,10 @@ impl Options {
             || self.interval.is_zero()
             || self.timeout.is_zero()
             || self.connect_timeout.is_zero()
+            || self.window_lead.is_zero()
         {
             return Err(invalid(
-                "--duration, --interval, --timeout, and --connect-timeout must be positive",
+                "--duration, --interval, --timeout, --connect-timeout, and --window-lead must be positive",
             ));
         }
         let intervals = self.duration.as_nanos().div_ceil(self.interval.as_nanos());

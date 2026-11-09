@@ -168,6 +168,22 @@ pub(crate) fn merge(workers: &[WorkerReport]) -> WorkerStatistics {
     total
 }
 
+/// When the controller marked the window for `base-benchmark`'s runner, in nanoseconds of the run's clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Markers {
+    /// `--window-lead`.
+    pub lead: u64,
+    /// Whether the start was marked before the start of the load was published, because the lead was at least the warmup.
+    pub before_start: bool,
+    /// When the start marker was sent and its acknowledgement read, which in a report is never after the window's start.
+    pub start_sent: u64,
+    pub acknowledged: u64,
+    /// When the stop marker was sent, after the window's end.
+    pub stop_sent: u64,
+    /// Whether the stop was marked once every request had an outcome, as in rate mode, rather than when the window ended.
+    pub drained: bool,
+}
+
 /// The results of a run.
 #[derive(Debug)]
 pub struct Report {
@@ -192,10 +208,32 @@ pub struct Report {
     pub(crate) connection_details: bool,
     /// The requests sent before the load, which have no outcome in the record.
     pub(crate) preflight_requests: u64,
+    /// When the window was marked, under `base-benchmark`'s runner, or `None` outside it.
+    pub(crate) markers: Option<Markers>,
     pub(crate) context: Value,
 }
 
 impl Report {
+    /// When the window started, in nanoseconds of the run's clock.
+    fn window_start(&self) -> u64 {
+        self.window_end - self.window
+    }
+
+    /// The window's markers, as the extension holds them: how long the acknowledgement took, how long before the window it came, how long after the window the stop was marked, and whether that was once every request had an outcome.
+    fn markers_json(&self) -> Value {
+        self.markers.map_or(Value::Null, |markers| {
+            json!({
+                "control": base_benchmark::CONTROL_STDIO,
+                "lead_ns": markers.lead,
+                "before_start": markers.before_start,
+                "acknowledgement_ns": markers.acknowledged - markers.start_sent,
+                "acknowledged_before_ns": self.window_start() - markers.acknowledged,
+                "stop_after_ns": markers.stop_sent.saturating_sub(self.window_end),
+                "stop_after_drain": markers.drained,
+            })
+        })
+    }
+
     pub fn statistics(&self) -> &WorkerStatistics {
         &self.total
     }
@@ -777,6 +815,7 @@ impl Report {
         let starvation = self.starvation();
         let mut extension = json!({
             "context": self.context,
+            "window": self.markers_json(),
             "planned": (self.mode == Mode::Rate).then_some(self.planned),
             "preflight_requests": self.preflight_requests,
             "periods": periods,
@@ -962,6 +1001,25 @@ impl Report {
         let _ = writeln!(text, "workers busy: {}; {verdict}", busy.join(" "));
         if let Some(reason) = self.held_back() {
             let _ = writeln!(text, "shortfall: {reason}");
+        }
+        if let Some(markers) = self.markers {
+            let _ = writeln!(
+                text,
+                "window marked for base-benchmark: start acknowledged in {}, {} before the window{}; stop marked {} after it{}",
+                micros(markers.acknowledged - markers.start_sent),
+                micros(self.window_start() - markers.acknowledged),
+                if markers.before_start {
+                    ", before the load started"
+                } else {
+                    ""
+                },
+                micros(markers.stop_sent.saturating_sub(self.window_end)),
+                if markers.drained {
+                    ", once every request had an outcome"
+                } else {
+                    ""
+                },
+            );
         }
         text
     }

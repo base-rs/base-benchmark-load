@@ -1,0 +1,29 @@
+[package]
+name = "hello"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[package.metadata.base-benchmark]
+smoke-arguments = []
+measure-arguments = []
+
+[[package.metadata.base-benchmark.scenario]]
+name = "hello"
+
+[[package.metadata.base-benchmark.scenario.role]]
+name = "server"
+kind = "service"
+subject = true
+ready = "listening on {address}"
+
+[[package.metadata.base-benchmark.scenario.role]]
+name = "client"
+kind = "driver"
+external = "load"
+invalid-responses = "responses_invalid"
+arguments = ["rate", "--address", "{server.address}", "--rate", "20k", "--connections", "16", "--cpus", "2", "--quiet"]
+smoke-arguments = ["--warmup", "200ms", "--duration", "200ms"]
+measure-arguments = ["--warmup", "1s", "--duration", "2s"]
