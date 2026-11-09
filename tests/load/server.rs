@@ -12,7 +12,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub const HELLO: &[u8] =
@@ -135,6 +135,92 @@ impl Server {
             listener,
             requests,
             accept: Some(accept),
+        }
+    }
+}
+
+impl Server {
+    /// A server that answers every request with [`HELLO`] until `point` after the first request of the load, and then never answers the load's even connections, in accept order, nor any connection accepted after the load's `connections`, which can only be their reconnections, since the others are answered and do not fail. The connections it stops answering are served, then starved, as the review of starvation found missed.
+    pub fn starving_after(connections: usize, point: Duration) -> Self {
+        let first = std::sync::OnceLock::new();
+        Self::start(move |arrival| {
+            if arrival.connection == 0 {
+                return Action::Respond(HELLO.to_vec());
+            }
+            let first = *first.get_or_init(Instant::now);
+            let starved = arrival.connection > connections || arrival.connection % 2 == 0;
+            if starved && first.elapsed() >= point {
+                Action::Ignore
+            } else {
+                Action::Respond(HELLO.to_vec())
+            }
+        })
+    }
+
+    /// A server with one thread that serves its connections in turns of `turn` requests, answering each with [`HELLO`]: it reads a connection's requests until it has answered `turn` of them, then moves to the next connection, waiting for each request it reads. While every connection keeps sending, it is fair. Once a closed loop's window ends, the client sends nothing more, so the thread waits for a request that never comes on the connection whose turn it is, and the requests the others had in flight at the window's end are never answered: they are starved only in the drain. A connection the client closes, as the preflight's is, leaves the rotation.
+    pub fn rotating(turn: usize) -> Self {
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (queue, accepted) = std::sync::mpsc::channel::<TcpStream>();
+        {
+            let requests = requests.clone();
+            std::thread::spawn(move || {
+                let mut rotation = std::collections::VecDeque::new();
+                loop {
+                    // Connections join the rotation behind those in it; with none, wait for one, until the accept loop ends.
+                    rotation.extend(accepted.try_iter().map(|stream| (stream, Vec::new())));
+                    if rotation.is_empty() {
+                        let Ok(stream) = accepted.recv() else {
+                            return;
+                        };
+                        rotation.push_back((stream, Vec::new()));
+                    }
+                    let (mut stream, mut buffer) = rotation.pop_front().unwrap();
+                    let open = (0..turn).all(|_| {
+                        let Some(rest) = read_head(&mut stream, &buffer) else {
+                            return false;
+                        };
+                        buffer = rest;
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        stream.write_all(HELLO).is_ok()
+                    });
+                    if open {
+                        rotation.push_back((stream, buffer));
+                    }
+                }
+            });
+        }
+        let accept = {
+            let listener = listener.clone();
+            std::thread::spawn(move || {
+                while let Ok((stream, _)) = listener.accept() {
+                    let _ = queue.send(stream);
+                }
+            })
+        };
+        Self {
+            address,
+            listener,
+            requests,
+            accept: Some(accept),
+        }
+    }
+}
+
+/// Read until `buffer` and what follows hold a request head, of a request without a body, and return what follows it, or `None` when the connection ends first.
+fn read_head(stream: &mut TcpStream, buffer: &[u8]) -> Option<Vec<u8>> {
+    let mut buffer = buffer.to_vec();
+    let mut chunk = [0; 16 * 1024];
+    loop {
+        if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            return Some(buffer.split_off(end + 4));
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return None,
+            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
         }
     }
 }

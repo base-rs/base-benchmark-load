@@ -46,7 +46,8 @@ Output:
   --busy-limit FRACTION      Flag the client as saturated when a worker is busy for more of the window [0.8].
   --schedule-lag-limit DURATION  In rate mode, flag the client as saturated when a worker's 99th percentile schedule lag exceeds this [50us].
   --shortfall-limit FRACTION In rate mode, flag the client as saturated when the workers reached more of the requests planned in the window only after it; more that they reached in it but sent after it are reported as held back by the connections, or by the server when the client kept its schedule, without saturating the client [0.001].
-  --fail-on CLASSES          Exit unsuccessfully, without a record, on invalid responses, errors, saturation, or starved connections: a comma-separated list of invalid, errors, saturated, starved.
+  --starved-limit FRACTION   Report a connection as starved when the server left it without a response, with a request outstanding or due, for longer than this fraction of the window, across failures and reconnections, and through the drain [0.25].
+  --fail-on CLASSES          Exit unsuccessfully, without a record, on invalid responses, errors, saturation, or connections starved in the window: a comma-separated list of invalid, errors, saturated, starved.
   --quiet                    Do not write the summary to stderr.
 
 The record goes to stdout as one line of JSON. Other commands: help, version.
@@ -84,7 +85,7 @@ pub struct FailOn {
     pub invalid: bool,
     pub errors: bool,
     pub saturated: bool,
-    /// A connection the server starved: it answered none of the connection's requests in the window, or left one waiting at least as long as the window.
+    /// A connection the server starved in the window: it answered none of the connection's requests in the window, or left the connection without a response for longer than `--starved-limit` of the window, in the window. A connection starved only in the drain, after the window, does not fail the run.
     pub starved: bool,
 }
 
@@ -118,6 +119,7 @@ pub struct Options {
     pub busy_limit: f64,
     pub schedule_lag_limit: Duration,
     pub shortfall_limit: f64,
+    pub starved_limit: f64,
     pub fail_on: FailOn,
     pub quiet: bool,
 }
@@ -131,7 +133,7 @@ pub enum Command {
 }
 
 /// The options that take a value.
-const VALUE_OPTIONS: [&str; 27] = [
+const VALUE_OPTIONS: [&str; 28] = [
     "--address",
     "--connections",
     "--depth",
@@ -158,6 +160,7 @@ const VALUE_OPTIONS: [&str; 27] = [
     "--busy-limit",
     "--schedule-lag-limit",
     "--shortfall-limit",
+    "--starved-limit",
     "--fail-on",
 ];
 
@@ -167,6 +170,8 @@ const DEFAULT_BUSY_LIMIT: f64 = 0.8;
 const DEFAULT_SCHEDULE_LAG_LIMIT: Duration = Duration::from_micros(50);
 /// The default `--shortfall-limit`: one in a thousand planned requests, a backlog growing by a millisecond each second. On hana, runs that kept up sent within 14 requests of their plan in the window, and runs whose median latency reached 5 ms or more fell 0.13% to 12% short.
 const DEFAULT_SHORTFALL_LIMIT: f64 = 0.001;
+/// The default `--starved-limit`: a quarter of the window. A fair server answers every connection at least once a round trip, so its starved spans stay near its round trip, which is under `--timeout` unless requests fail; only a fair server with a round trip a quarter of the window long, with at most four responses a connection in it, would reach it. A connection starved for longer has lost a quarter of its share of the window, and one starved at the window's end has a span that runs on through the drain. The limit is not tied to `--timeout`, whose default, 10 seconds, exceeds a typical window, so that partial starvation in it would go unreported.
+const DEFAULT_STARVED_LIMIT: f64 = 0.25;
 
 /// The most reporting intervals a window may have; each needs a small histogram per worker.
 pub const INTERVAL_COUNT_LIMIT: u64 = 100_000;
@@ -202,6 +207,7 @@ impl Options {
             busy_limit: DEFAULT_BUSY_LIMIT,
             schedule_lag_limit: DEFAULT_SCHEDULE_LAG_LIMIT,
             shortfall_limit: DEFAULT_SHORTFALL_LIMIT,
+            starved_limit: DEFAULT_STARVED_LIMIT,
             fail_on: FailOn::default(),
             quiet: false,
         }
@@ -299,6 +305,9 @@ impl Options {
                 }
                 "--shortfall-limit" => {
                     fraction(&value).map(|fraction| options.shortfall_limit = fraction)
+                }
+                "--starved-limit" => {
+                    fraction(&value).map(|fraction| options.starved_limit = fraction)
                 }
                 _ => fail_on(options.fail_on, &value).map(|fail_on| options.fail_on = fail_on),
             }?;

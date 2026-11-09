@@ -588,7 +588,7 @@ fn done<P: Poller>(
         }
         return true;
     }
-    match settings.schedule {
+    let done = match settings.schedule {
         Some(_) => statistics.finished() == planned,
         None => {
             now >= settings.timing.window_end
@@ -596,7 +596,13 @@ fn done<P: Poller>(
                     .iter()
                     .all(|connection| connection.in_flight.is_empty())
         }
+    };
+    if done {
+        for connection in connections.iter_mut() {
+            connection.finish(now, settings);
+        }
     }
+    done
 }
 
 #[cfg(test)]

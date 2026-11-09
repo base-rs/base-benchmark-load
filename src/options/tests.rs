@@ -31,6 +31,7 @@ fn defaults() {
         }
     );
     assert_eq!(options.workers, 1);
+    assert_eq!(options.starved_limit, 0.25);
     assert_eq!(Mode::Closed.name(), "closed");
     assert_eq!(Mode::Rate.name(), "rate");
 }
@@ -95,6 +96,8 @@ fn every_option() {
         "75µs",
         "--shortfall-limit",
         "0.01",
+        "--starved-limit",
+        "0.4",
         "--fail-on",
         "invalid,errors",
         "--fail-on",
@@ -139,6 +142,7 @@ fn every_option() {
     assert_eq!(options.busy_limit, 0.5);
     assert_eq!(options.schedule_lag_limit, Duration::from_micros(75));
     assert_eq!(options.shortfall_limit, 0.01);
+    assert_eq!(options.starved_limit, 0.4);
     assert_eq!(
         options.fail_on,
         FailOn {

@@ -142,12 +142,16 @@ impl<T: Read + Write> Connection<T> {
                 None if now < settings.timing.window_end => settings.timing.start,
                 _ => break,
             };
-            self.in_flight.push_back(Request {
+            let request = Request {
                 ordinal: self.next_ordinal,
                 planned,
                 sent: now,
                 eligible: planned.max(self.available),
-            });
+            };
+            // A slot with nothing outstanding or due begins waiting with this request.
+            self.counters
+                .pending(settings.timing.waiting_since(&request));
+            self.in_flight.push_back(request);
             self.output.extend_from_slice(settings.request);
             self.next_ordinal += settings.connections;
             statistics.sent(&settings.timing, now);
@@ -282,6 +286,9 @@ impl<T: Read + Write> Connection<T> {
         if self.in_flight.len() + 1 == settings.depth {
             self.available = now;
         }
+        // Any response, valid or not, is the server answering the slot.
+        let pending = !self.in_flight.is_empty() || self.due(now, settings);
+        self.counters.answered(&settings.timing, now, pending);
         statistics.complete(
             &settings.timing,
             &request,
@@ -317,7 +324,26 @@ impl<T: Read + Write> Connection<T> {
             .is_some_and(|request| now.saturating_sub(request.sent) >= settings.timeout)
     }
 
-    /// Close the connection after `kind` of failure, charge it to every outstanding request, and allow a reconnection after the delay.
+    /// Whether the slot has a request due that it has not sent: in the closed loop, until the window ends; in the open loop, a planned request whose time has come.
+    fn due(&self, now: u64, settings: &Settings) -> bool {
+        match settings.schedule {
+            Some(schedule) => {
+                self.next_ordinal < settings.total
+                    && settings.timing.start + schedule.offset(self.next_ordinal) <= now
+            }
+            None => now < settings.timing.window_end,
+        }
+    }
+
+    /// When a slot with nothing outstanding stopped having anything due, at `now` or before: in the closed loop, it has nothing to send after the window.
+    fn settled(&self, now: u64, settings: &Settings) -> u64 {
+        match settings.schedule {
+            Some(_) => now,
+            None => now.min(settings.timing.window_end),
+        }
+    }
+
+    /// Close the connection after `kind` of failure, charge it to every outstanding request, and allow a reconnection after the delay. The failure ends the slot's starved span, without a response, unless it still has a request due, which it will send once it reconnects.
     pub fn fail(
         &mut self,
         kind: ErrorKind,
@@ -325,8 +351,16 @@ impl<T: Read + Write> Connection<T> {
         settings: &Settings,
         statistics: &mut WorkerStatistics,
     ) {
+        let end = if self.in_flight.is_empty() {
+            self.settled(now, settings)
+        } else {
+            now
+        };
         for request in self.in_flight.drain(..) {
             statistics.fail(&settings.timing, &request, now, kind, &mut self.counters);
+        }
+        if !self.due(now, settings) {
+            self.counters.idle(&settings.timing, end);
         }
         self.stream = None;
         self.state = State::Down {
@@ -350,6 +384,7 @@ impl<T: Read + Write> Connection<T> {
             if self.next_ordinal < settings.total {
                 let planned = settings.timing.start + schedule.offset(self.next_ordinal);
                 self.counters.waited(&settings.timing, planned, now, false);
+                self.counters.pending(planned);
             }
             let warmup = count_below(
                 self.next_ordinal,
@@ -362,6 +397,13 @@ impl<T: Read + Write> Connection<T> {
             self.next_ordinal = settings.total.max(self.next_ordinal);
         }
         self.state = State::Down { until: u64::MAX };
+        self.finish(now, settings);
+    }
+
+    /// At the end of the run, with nothing outstanding: end the slot's starved span, if one is open, without a response, when it stopped having anything due.
+    pub fn finish(&mut self, now: u64, settings: &Settings) {
+        self.counters
+            .idle(&settings.timing, self.settled(now, settings));
     }
 }
 
