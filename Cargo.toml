@@ -10,7 +10,7 @@ readme = "readme.md"
 include = ["src/**", "context/**", "Cargo.toml", "readme.md", "license.md", "releases.md"]
 
 [dependencies]
-base-benchmark = { version = "0.2.1", default-features = false }
+base-benchmark = { version = "0.4.0", default-features = false }
 httparse = "1.10.1"
 libc = "0.2.191"
 serde_json = "1.0.154"

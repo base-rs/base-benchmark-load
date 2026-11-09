@@ -73,6 +73,8 @@ fn every_option() {
         "100us",
         "--interval",
         "500ms",
+        "--window-lead",
+        "2ms",
         "--method",
         "POST",
         "--path",
@@ -120,6 +122,7 @@ fn every_option() {
     assert_eq!(options.drain_timeout, Duration::from_secs(60));
     assert_eq!(options.reconnect_delay, Duration::from_micros(100));
     assert_eq!(options.interval, Duration::from_millis(500));
+    assert_eq!(options.window_lead, Duration::from_millis(2));
     assert_eq!(
         (options.method.as_str(), options.path.as_str()),
         ("POST", "/echo?x=1")
@@ -189,6 +192,12 @@ fn help_and_version() {
     assert_eq!(parse(&["version"]).unwrap(), Command::Version);
     assert_eq!(parse(&["--version"]).unwrap(), Command::Version);
     assert!(USAGE.contains("--fail-on"));
+    // Under the runner, a line of stdout that begins like a window marker is taken as one, so the usage text, which goes to stdout, has none.
+    assert!(
+        USAGE
+            .lines()
+            .all(|line| !line.starts_with("base-benchmark window"))
+    );
 }
 
 #[test]
@@ -317,6 +326,10 @@ fn invalid_combinations() {
         ),
         (
             &["closed", "--address", "a:1", "--connect-timeout", "0"],
+            "must be positive",
+        ),
+        (
+            &["closed", "--address", "a:1", "--window-lead", "0"],
             "must be positive",
         ),
         (

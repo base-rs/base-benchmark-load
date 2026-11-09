@@ -14,9 +14,11 @@ mod rate;
 mod server;
 mod setup;
 mod starved;
+mod window;
 
+use base_benchmark::Window;
 use base_benchmark::{Measurement, ProcessRecord};
-use base_benchmark_load::{Command, ErrorKind, Options, Outcomes, Period, Report, run};
+use base_benchmark_load::{Command, ErrorKind, Options, Outcomes, Period, Report, run_with_window};
 use serde_json::Value;
 
 pub const MS: f64 = 1_000_000.0;
@@ -47,12 +49,22 @@ pub fn load(
     address: std::net::SocketAddr,
     arguments: &[&str],
 ) -> std::io::Result<Report> {
+    load_with_window(mode, address, arguments, None)
+}
+
+/// Run as [`load`] does, marking the window with `window`, as under `base-benchmark`'s runner.
+pub fn load_with_window(
+    mode: &str,
+    address: std::net::SocketAddr,
+    arguments: &[&str],
+    window: Option<&mut Window>,
+) -> std::io::Result<Report> {
     let address = address.to_string();
     let mut all = vec![mode, "--address", &address];
     // Later arguments override earlier ones.
     all.extend_from_slice(&WATCHDOGS);
     all.extend_from_slice(arguments);
-    run(&options(&all))
+    run_with_window(&options(&all), window)
 }
 
 pub fn record(report: &Report) -> ProcessRecord {

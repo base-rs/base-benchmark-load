@@ -10,9 +10,11 @@ use super::{
 use base_benchmark::ProcessRecord;
 use std::process::{Command, Output};
 
+/// Run the binary outside `base-benchmark`'s runner, whatever the environment of the tests.
 fn command(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_base-benchmark-load"))
         .args(arguments)
+        .env_remove(base_benchmark::CONTROL_VARIABLE)
         .output()
         .unwrap()
 }
