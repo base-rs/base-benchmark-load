@@ -199,6 +199,7 @@ fn a_worker_that_panics_while_setting_up_fails_the_run() {
         0,
         None,
         1,
+        false,
         &MonotonicClock::new(),
         |worker, start| {
             let arrival = start.arrival(worker);
@@ -247,6 +248,7 @@ fn a_worker_that_cannot_be_spawned_fails_the_run() {
                 0,
                 None,
                 1,
+                false,
                 &MonotonicClock::new(),
                 |worker, start| {
                     let setup = match worker {

@@ -160,7 +160,7 @@ fn marking(which: &str, error: io::Error) -> io::Error {
 
 /// Control a run from the calling thread: start `workers` threads, each running `worker`, which reports its setup to the [`Start`] it is given; once all have set up, pin the calling thread to `controller_cpu`, if any, and start them together; measure the window with an [`Interval`], and each CPU's software interrupt time over it; and collect their results. Each worker's thread is spawned from the builder `prepare` returns, given its index, a builder that names it, and the start.
 ///
-/// With a `window`, under `base-benchmark`'s runner, the controller also marks the window, so that the runner's snapshots of the services bracket the counted requests. The runner acknowledges the start once it has taken its snapshots, and no request planned in the window, nor any outcome of the closed loop's window, comes before the window starts, so the start is marked, and its acknowledgement awaited, before the window does. When `lead` is at least the warmup, the start is marked once every worker has connected, before the start is published, which therefore follows the acknowledgement: the services' window then takes in the warmup, but its acknowledgement always comes first. Otherwise the start is published first, and the start is marked `lead` before the window, during the warmup, so that the services' window takes in at most `lead` of it; an acknowledgement that comes after the window has started fails the run. The stop is marked when the controller wakes at the window's end, before the controller's interval ends.
+/// With a `window`, under `base-benchmark`'s runner, the controller also marks the window, so that the runner's snapshots of the services bracket the counted requests. The runner acknowledges the start once it has taken its snapshots, and no request planned in the window, nor any outcome of the closed loop's window, comes before the window starts, so the start is marked, and its acknowledgement awaited, before the window does. When `lead` is at least the warmup, the start is marked once every worker has connected, before the start is published, which therefore follows the acknowledgement: the services' window then takes in the warmup, but its acknowledgement always comes first. Otherwise the start is published first, and the start is marked `lead` before the window, during the warmup, so that the services' window takes in at most `lead` of it; an acknowledgement that comes after the window has started fails the run. With `drained`, as in rate mode, whose window counts the requests planned in it, the stop is marked once every worker has finished, and so every request has an outcome, so that the services' window takes in their work for every request the window counts, however late it was sent or served; nothing is planned after the window, so the drain holds no other work but that of the warmup's requests still outstanding. Otherwise, as in the closed loop, whose window counts the outcomes that happen in it, the stop is marked when the controller wakes at the window's end, before the controller's interval ends.
 ///
 /// Fails when a worker's thread cannot be spawned, as when the process may have no more threads or memory; when a worker fails to set up, including when it panics before it reports; or when the controller cannot pin its CPU. The workers that started are released and joined first, so a panic is reported as the error that names its worker. Fails too when a marker cannot be sent or its acknowledgement read, or comes too late: before the start is published, the workers are released without running, and after it, the run fails once they have finished.
 #[allow(clippy::too_many_arguments)]
@@ -171,6 +171,7 @@ fn drive(
     duration: u64,
     mut window: Option<&mut Window>,
     lead: u64,
+    drained: bool,
     clock: &MonotonicClock,
     worker: impl Fn(usize, &Start) -> Option<WorkerResult> + Sync,
     prepare: impl Fn(usize, Builder, &Start) -> io::Result<Builder>,
@@ -258,22 +259,27 @@ fn drive(
         let interval = Interval::start().expect("measuring the current process succeeds");
         let softirq_start = os::softirq_times().ok();
         sleep_until(clock, window_end);
-        let stop_sent = clock.now();
-        let mut markers = None;
-        if let (Some(window), Some((start_sent, acknowledged)), None) = (window, started, &failure)
-        {
-            match window.stop() {
-                Ok(()) => {
-                    markers = Some(Markers {
-                        lead,
-                        before_start,
-                        start_sent,
-                        acknowledged,
-                        stop_sent,
-                    })
-                }
-                Err(error) => failure = Some(marking("stop", error)),
-            }
+        // The stop is marked only for a window whose start was acknowledged in time.
+        let mut stopping = window.zip(started).filter(|_| failure.is_none());
+        let stop = |window: &mut Window, (start_sent, acknowledged): (u64, u64)| {
+            let stop_sent = clock.now();
+            window
+                .stop()
+                .map(|()| Markers {
+                    lead,
+                    before_start,
+                    start_sent,
+                    acknowledged,
+                    stop_sent,
+                    drained,
+                })
+                .map_err(|error| marking("stop", error))
+        };
+        let mut stopped = None;
+        if !drained {
+            stopped = stopping
+                .take()
+                .map(|(window, started)| stop(window, started));
         }
         let sample = interval
             .finish(1)
@@ -299,9 +305,13 @@ fn drive(
                     .expect("started workers return their results")
             })
             .collect();
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(Controlled {
+        // Every request now has an outcome, and its response, if any, has been read, so the services' work for every request planned in the window precedes this stop.
+        if let Some((window, started)) = stopping {
+            stopped = Some(stop(window, started));
+        }
+        match (failure, stopped.transpose()) {
+            (Some(error), _) | (None, Err(error)) => Err(error),
+            (None, Ok(markers)) => Ok(Controlled {
                 origin,
                 sample,
                 softirq,
@@ -321,7 +331,7 @@ pub fn run(options: &Options) -> io::Result<Report> {
 
 /// Run the load the options describe, as [`run`] does, and mark its measured window with `window`, as a driver under `base-benchmark`'s runner, which gives it with [`Window::from_environment`]. The calling thread, which controls the run, sends the markers, so the window's output, such as stdout, must have nothing else written to it during the run.
 ///
-/// The start marker is sent before the window starts, `--window-lead` before it, or once every worker has connected when the lead is at least the warmup, and the run waits for its acknowledgement, so the runner's snapshots of the services precede the window: in rate mode, every request planned in it, and in the closed loop, every outcome it counts, though the requests in flight across its start, at most `--depth` per connection, were sent during the warmup and may have reached the server before the snapshots. The stop marker is sent when the window ends. Fails, besides as [`run`] does, when a marker cannot be sent, the acknowledgement cannot be read or is not one, or it comes after the window has started; after the load has started, only once every request has an outcome.
+/// The start marker is sent before the window starts, `--window-lead` before it, or once every worker has connected when the lead is at least the warmup, and the run waits for its acknowledgement, so the runner's snapshots of the services precede the window: in rate mode, every request planned in it, and in the closed loop, every outcome it counts. A request the closed loop counts was sent before its outcome, and reached the server before the snapshots only if it was outstanding for longer than the time from the acknowledgement to the window's start, about the lead; with the start marked before the load, none did. In rate mode the stop marker is sent once every request has an outcome, after the drain, so that the services' work for requests planned in the window but sent or served after it, as when the client lags or the server falls behind, is in the services' window too; in the closed loop, whose window counts the outcomes in it, when the window ends. Fails, besides as [`run`] does, when a marker cannot be sent, the acknowledgement cannot be read or is not one, or it comes after the window has started; after the load has started, only once every request has an outcome.
 pub fn run_with_window(options: &Options, window: Option<&mut Window>) -> io::Result<Report> {
     let address = resolve(&options.address)?;
     let request = RequestTemplate::new(
@@ -392,6 +402,7 @@ pub fn run_with_window(options: &Options, window: Option<&mut Window>) -> io::Re
         load.duration,
         window,
         nanoseconds(options.window_lead),
+        options.mode == Mode::Rate,
         &clock,
         |worker, start| work(&load, worker, Epoll::new(), &clock, start),
         |_, builder, _| Ok(builder),

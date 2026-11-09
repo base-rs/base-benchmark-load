@@ -1,10 +1,10 @@
 // Released under the MIT License.
 // Copyright, 2026, by Samuel Williams.
 
-//! The measured window under `base-benchmark`'s runner: the start marker, acknowledged before any request planned in the window reaches the server; the stop marker; and the record after both, on stdout. The runner is played by the test, which logs when it would take its snapshot of the services, in one log with the server's arrivals, so that the order of the two is asserted from events alone.
+//! The measured window under `base-benchmark`'s runner: the start marker, acknowledged before any request planned in the window reaches the server; the stop marker, in rate mode once every request has an outcome, and in the closed loop when the window ends; and the record after both, on stdout. The runner is played by the test, which logs when it would take its snapshots of the services, in one log with the server's arrivals, so that the order of the two is asserted from events alone, and only where one causes the other: a server or worker delayed for any time changes nothing asserted.
 
 use super::{
-    count, extension, load_with_window,
+    CLOSED_WINDOW, WATCHDOGS, count, extension, load_with_window,
     server::{Action, Arrival, HELLO, Server},
 };
 use base_benchmark::{
@@ -20,7 +20,7 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
-    /// A request the server read.
+    /// A request the server read, logged in a test that stalls its response only once the stall is over, as it answers.
     Request(usize, usize),
     /// The runner's snapshot at the start marker, before it acknowledges it.
     Started,
@@ -51,6 +51,21 @@ fn started(log: &[Event]) -> usize {
         .collect();
     assert_eq!(started.len(), 1, "{log:?}");
     started[0]
+}
+
+/// Where in `log` the runner took its snapshot at the stop marker, asserting that it did once, after the snapshot at the start marker.
+fn stopped(log: &[Event]) -> usize {
+    let stopped: Vec<usize> = (0..log.len())
+        .filter(|index| log[*index] == Event::Stopped)
+        .collect();
+    assert_eq!(stopped.len(), 1, "{log:?}");
+    assert!(stopped[0] > started(log), "{log:?}");
+    stopped[0]
+}
+
+/// Assert that the stop was marked after the server read every request, as it must be in rate mode, where it is marked once every request has an outcome: each was read, and logged, before it was answered.
+fn stopped_after_every_request(log: &[Event]) {
+    assert_eq!(stopped(log), log.len() - 1, "{log:?}");
 }
 
 /// Assert that the load's only connection had none of its requests from ordinal `first` on, those counted in the window, read before the runner's snapshot, and that it had some read after it.
@@ -139,6 +154,7 @@ fn the_binary_marks_its_window_before_its_record() {
             "--duration",
             "50ms",
         ])
+        .args(WATCHDOGS)
         .env(CONTROL_VARIABLE, CONTROL_STDIO)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -171,9 +187,11 @@ fn the_binary_marks_its_window_before_its_record() {
     // Without a warmup, the start is marked before the load starts, so no request but the preflight comes before the snapshot.
     let log = log.lock().unwrap();
     counted_after_the_snapshot(&log, 0);
+    stopped_after_every_request(&log);
     let window = &extension(&record)["window"];
     assert_eq!(window["control"], "stdio");
     assert_eq!(window["before_start"], true);
+    assert_eq!(window["stop_after_drain"], true);
     // The load starts 100 ms after the acknowledgement.
     assert!(window["acknowledged_before_ns"].as_u64().unwrap() >= 100_000_000);
     assert!(stderr.contains("window marked for base-benchmark: start acknowledged in"));
@@ -234,11 +252,114 @@ fn a_start_marked_in_the_warmup_is_acknowledged_before_the_window() {
     assert_eq!(record.samples[0].operations, 20);
     let log = log.lock().unwrap();
     counted_after_the_snapshot(&log, 600);
-    assert_eq!(log.last(), Some(&Event::Stopped));
+    // Not that the last request counted reached the server before the window's end, which a delayed worker or server can defer past it: the stop waits for its outcome.
+    stopped_after_every_request(&log);
     let window = &extension(&record)["window"];
     assert_eq!(window["before_start"], false);
     assert_eq!(window["lead_ns"], 2_000_000_000u64);
     assert!(report.summary().contains("before the window; stop marked"));
+}
+
+/// In rate mode, whose window counts the requests planned in it, the stop is marked once every request has an outcome, so that the services' window takes in their work for every request it counts, however late it was served: the server stalls its response to the window's last request, logging it only as it answers, after the stall, and the stop still follows. The stall only makes a stop marked at the window's end come first; nothing asserted depends on its length.
+#[test]
+fn rate_mode_marks_the_stop_once_every_request_has_an_outcome() {
+    let log = Log::default();
+    let server = {
+        let log = log.clone();
+        Server::start(move |arrival| {
+            if arrival.connection == 1 && arrival.request == 9 {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            log.lock()
+                .unwrap()
+                .push(Event::Request(arrival.connection, arrival.request));
+            Action::Respond(HELLO.to_vec())
+        })
+    };
+    let mut window = Window::new(markers(&log), acknowledgement(Duration::ZERO));
+    let report = load_with_window(
+        "rate",
+        server.address,
+        &[
+            "--rate",
+            "1000",
+            "--connections",
+            "1",
+            "--warmup",
+            "0",
+            "--duration",
+            "10ms",
+            "--quiet",
+        ],
+        Some(&mut window),
+    )
+    .unwrap();
+    let record = report.record().unwrap();
+    // The window holds requests 0 to 9.
+    assert_eq!(record.samples[0].operations, 10);
+    let log = log.lock().unwrap();
+    counted_after_the_snapshot(&log, 0);
+    stopped_after_every_request(&log);
+    assert_eq!(log[log.len() - 2], Event::Request(1, 9));
+    assert_eq!(extension(&record)["window"]["stop_after_drain"], true);
+    assert!(
+        report
+            .summary()
+            .contains("after it, once every request had an outcome\n")
+    );
+}
+
+/// In the closed loop, whose window counts the outcomes that happen in it, the stop is marked when the window ends, without waiting for the drain: the server holds its response to the first request of one of two connections until the runner has taken its snapshot at the stop, and the run then drains it.
+#[test]
+fn the_closed_loop_marks_the_stop_when_the_window_ends() {
+    let log = Log::default();
+    let server = {
+        let log = log.clone();
+        Server::start(move |arrival| {
+            if arrival.connection == 1 && arrival.request == 0 {
+                while !log.lock().unwrap().contains(&Event::Stopped) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            log.lock()
+                .unwrap()
+                .push(Event::Request(arrival.connection, arrival.request));
+            Action::Respond(HELLO.to_vec())
+        })
+    };
+    let mut window = Window::new(markers(&log), acknowledgement(Duration::ZERO));
+    let report = load_with_window(
+        "closed",
+        server.address,
+        &[
+            "--connections",
+            "2",
+            "--warmup",
+            "0",
+            "--duration",
+            CLOSED_WINDOW,
+            "--quiet",
+        ],
+        Some(&mut window),
+    )
+    .unwrap();
+    // The other connection's valid responses in the window make a record.
+    let record = report.record().unwrap();
+    let log = log.lock().unwrap();
+    let stopped = stopped(&log);
+    let held = log.iter().position(|event| *event == Event::Request(1, 0));
+    assert!(held.unwrap() > stopped, "{log:?}");
+    assert_eq!(extension(&record)["window"]["stop_after_drain"], false);
+    assert!(
+        report
+            .summary()
+            .contains("before the load started; stop marked")
+    );
+    assert!(
+        !report
+            .summary()
+            .contains("once every request had an outcome")
+    );
 }
 
 /// An acknowledgement that comes after the window has started fails the run, once its requests have outcomes, since the runner's snapshot may follow counted requests. The runner here acknowledges only 50 ms after the start was marked, which was at most the 1 ms lead before the window.

@@ -180,6 +180,8 @@ pub(crate) struct Markers {
     pub acknowledged: u64,
     /// When the stop marker was sent, after the window's end.
     pub stop_sent: u64,
+    /// Whether the stop was marked once every request had an outcome, as in rate mode, rather than when the window ended.
+    pub drained: bool,
 }
 
 /// The results of a run.
@@ -217,7 +219,7 @@ impl Report {
         self.window_end - self.window
     }
 
-    /// The window's markers, as the extension holds them: how long the acknowledgement took, how long before the window it came, and how long after the window the stop was marked.
+    /// The window's markers, as the extension holds them: how long the acknowledgement took, how long before the window it came, how long after the window the stop was marked, and whether that was once every request had an outcome.
     fn markers_json(&self) -> Value {
         self.markers.map_or(Value::Null, |markers| {
             json!({
@@ -227,6 +229,7 @@ impl Report {
                 "acknowledgement_ns": markers.acknowledged - markers.start_sent,
                 "acknowledged_before_ns": self.window_start() - markers.acknowledged,
                 "stop_after_ns": markers.stop_sent.saturating_sub(self.window_end),
+                "stop_after_drain": markers.drained,
             })
         })
     }
@@ -1002,7 +1005,7 @@ impl Report {
         if let Some(markers) = self.markers {
             let _ = writeln!(
                 text,
-                "window marked for base-benchmark: start acknowledged in {}, {} before the window{}; stop marked {} after it",
+                "window marked for base-benchmark: start acknowledged in {}, {} before the window{}; stop marked {} after it{}",
                 micros(markers.acknowledged - markers.start_sent),
                 micros(self.window_start() - markers.acknowledged),
                 if markers.before_start {
@@ -1011,6 +1014,11 @@ impl Report {
                     ""
                 },
                 micros(markers.stop_sent.saturating_sub(self.window_end)),
+                if markers.drained {
+                    ", once every request had an outcome"
+                } else {
+                    ""
+                },
             );
         }
         text
