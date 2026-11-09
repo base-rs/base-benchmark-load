@@ -253,8 +253,8 @@ fn a_server_that_serves_every_connection_starves_none() {
 const PARTIAL_WINDOW: &str = "6s";
 const PARTIAL_LIMIT_NS: u64 = 1_500_000_000;
 
-/// The response timeout of the runs against [`Server::starving_after`]: shorter than the window, so that no single wait for a response is as long as it, and the slots the server stops answering time out and reconnect in it. It is shorter than the limit, too, so that only a span across timeouts and reconnections is longer than the limit; it is also the served connections' watchdog, since a served connection that timed out would reconnect, and the server never answers a reconnection.
-const PARTIAL_TIMEOUT: &str = "1s";
+/// The response timeout of the runs against [`Server::starving_after`]: shorter than the window, so that no single wait for a response is as long as it, and the slots the server stops answering time out and reconnect in it. It is longer than the limit, so that the served connections' watchdog is the limit: a served connection that timed out would reconnect, and the server never answers a reconnection.
+const PARTIAL_TIMEOUT: &str = "2s";
 
 /// Four connections, of which the server stops answering two, and their reconnections, at a point in the window: each was answered in the window, and no request waited as long as the window, but each was starved from the point on, across its timeouts and reconnections, and the rest of the run.
 fn assert_starved_after_a_point(report: &Report) {
@@ -303,7 +303,7 @@ fn assert_starved_after_a_point(report: &Report) {
     );
 }
 
-/// A closed loop against a server that stops answering two of four connections, and their reconnections, a second into the window. A connection always has a request outstanding or to send in the window, so each starved slot's span runs from its last response, at most a second after the window's start unless the client or the server stalls, to the window's end at least: five seconds, longer than the limit, while each of its requests timed out after a second.
+/// A closed loop against a server that stops answering two of four connections, and their reconnections, a second into the window. A connection always has a request outstanding or to send in the window, so each starved slot's span runs from its last response, at most a second after the window's start unless the client or the server stalls, to the window's end at least: five seconds, longer than the limit, while each of its requests timed out after two.
 #[test]
 fn a_closed_loop_reports_connections_starved_after_a_point() {
     let server = Server::starving_after(4, Duration::from_secs(1));
@@ -326,10 +326,10 @@ fn a_closed_loop_reports_connections_starved_after_a_point() {
     assert_starved_after_a_point(&report);
 }
 
-/// An open loop against a server that stops answering two of four connections, and their reconnections, three seconds into the window. A starved slot's requests keep falling due every 20 ms, so after each timeout it has a request due, and its span runs from its last response, at most three seconds into the window unless the client or the server stalls, through every timeout and reconnection to its last request's failure: a second after the last request planned in the window is sent, or the drain deadline, a second after the window, so about four seconds. No request waited as long as the window: the longest waited from its planned time, after the point, to the drain deadline.
+/// An open loop against a server that stops answering two of four connections, and their reconnections, two and a half seconds into the window. A starved slot's requests keep falling due every 20 ms, so after each timeout it has a request due, and its span runs from its last response, at most two and a half seconds into the window unless the client or the server stalls, through every timeout and reconnection to its last request's failure, at the drain deadline, a second after the window, so about four and a half seconds. No request waited as long as the window: the longest waited from its planned time, after the point, to the drain deadline.
 #[test]
 fn an_open_loop_reports_connections_starved_after_a_point() {
-    let server = Server::starving_after(4, Duration::from_secs(3));
+    let server = Server::starving_after(4, Duration::from_millis(2500));
     let report = load(
         "rate",
         server.address,
@@ -353,7 +353,7 @@ fn an_open_loop_reports_connections_starved_after_a_point() {
     assert_starved_after_a_point(&report);
 }
 
-/// A closed loop against a server whose one thread serves its four connections in turns of ten requests, waiting for each: fair while the client sends, but once the window ends, it waits on one connection for a request that never comes, and the requests at least two others had in flight are never answered. They time out a second after their send, so their spans, from their last response in the window, are longer than the limit, but only with the drain: in the window, the rotation answered every connection every forty requests. The run is reported as starving them, and why, but `--fail-on starved` keeps it.
+/// A closed loop against a server whose one thread serves its four connections in turns of ten requests, waiting for each: fair while the client sends, but once the window ends, it waits on one connection for a request that never comes, and the requests at least two others had in flight are never answered. They time out three seconds after their send, so their spans, from their last response in the window, are longer than the limit, the whole window, but only with the drain: in the window, the rotation answered every connection every forty requests, and the window is the watchdog for a stall of the server's thread. The run is reported as starving them, and why, but `--fail-on starved` keeps it.
 #[test]
 fn starvation_only_in_the_drain_is_reported_but_spares_the_run() {
     let server = Server::rotating(10);
@@ -368,9 +368,11 @@ fn starvation_only_in_the_drain_is_reported_but_spares_the_run() {
             "--duration",
             CLOSED_WINDOW,
             "--timeout",
-            "1s",
+            "3s",
             "--drain-timeout",
-            DRAIN,
+            "3s",
+            "--starved-limit",
+            "1",
             "--connection-details",
         ],
     )
@@ -410,6 +412,6 @@ fn starvation_only_in_the_drain_is_reported_but_spares_the_run() {
     let (starved, _) = details(&record);
     for connection in &starved {
         assert_eq!(connection["drain_only"], true, "{connection}");
-        assert!(connection["span_max_ns"].as_u64().unwrap() > 500_000_000);
+        assert!(connection["span_max_ns"].as_u64().unwrap() > 2_000_000_000);
     }
 }
