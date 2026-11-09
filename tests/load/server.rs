@@ -12,7 +12,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 pub const HELLO: &[u8] =
@@ -140,16 +140,14 @@ impl Server {
 }
 
 impl Server {
-    /// A server that answers every request with [`HELLO`] until `point` after the first request of the load, and then never answers the load's even connections, in accept order, nor any connection accepted after the load's `connections`, which can only be their reconnections, since the others are answered and do not fail. The connections it stops answering are served, then starved, as the review of starvation found missed.
-    pub fn starving_after(connections: usize, point: Duration) -> Self {
-        let first = std::sync::OnceLock::new();
+    /// A server that answers every request with [`HELLO`], except that it stops answering the load's even connections, in accept order, after their `answered`th response, and never answers a connection accepted after the load's `connections`, which can only be a reconnection, since a connection the server answers fails only if the client stalls for its whole `--timeout`. The point is an event, not a time: the connections it stops answering are served, then starved, however fast the host runs, as the review of starvation found missed.
+    pub fn starving_after(connections: usize, answered: usize) -> Self {
         Self::start(move |arrival| {
-            if arrival.connection == 0 {
-                return Action::Respond(HELLO.to_vec());
-            }
-            let first = *first.get_or_init(Instant::now);
-            let starved = arrival.connection > connections || arrival.connection % 2 == 0;
-            if starved && first.elapsed() >= point {
+            let reconnection = arrival.connection > connections;
+            let stopped = arrival.connection != 0
+                && arrival.connection % 2 == 0
+                && arrival.request >= answered;
+            if reconnection || stopped {
                 Action::Ignore
             } else {
                 Action::Respond(HELLO.to_vec())
@@ -157,45 +155,41 @@ impl Server {
         })
     }
 
-    /// A server with one thread that serves its connections in turns of `turn` requests, answering each with [`HELLO`]: it reads a connection's requests until it has answered `turn` of them, then moves to the next connection, waiting for each request it reads. While every connection keeps sending, it is fair. Once a closed loop's window ends, the client sends nothing more, so the thread waits for a request that never comes on the connection whose turn it is, and the requests the others had in flight at the window's end are never answered: they are starved only in the drain. A connection the client closes, as the preflight's is, leaves the rotation.
-    pub fn rotating(turn: usize) -> Self {
+    /// A server that answers each request of the load with [`HELLO`] only when the next request arrives, on any connection, so that it holds only the request that arrived last. While a closed loop's connections send, each request is answered by the next arrival, which a round trip of another connection brings; once the window ends, the client sends nothing more, so exactly one request, the one that arrived last, is never answered, and is starved only in the drain. The preflight connection, accepted first, is answered at once, since the load waits for it.
+    pub fn relaying() -> Self {
         let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
-        let (queue, accepted) = std::sync::mpsc::channel::<TcpStream>();
-        {
-            let requests = requests.clone();
-            std::thread::spawn(move || {
-                let mut rotation = std::collections::VecDeque::new();
-                loop {
-                    // Connections join the rotation behind those in it; with none, wait for one, until the accept loop ends.
-                    rotation.extend(accepted.try_iter().map(|stream| (stream, Vec::new())));
-                    if rotation.is_empty() {
-                        let Ok(stream) = accepted.recv() else {
-                            return;
-                        };
-                        rotation.push_back((stream, Vec::new()));
-                    }
-                    let (mut stream, mut buffer) = rotation.pop_front().unwrap();
-                    let open = (0..turn).all(|_| {
-                        let Some(rest) = read_head(&mut stream, &buffer) else {
-                            return false;
-                        };
-                        buffer = rest;
-                        requests.fetch_add(1, Ordering::Relaxed);
-                        stream.write_all(HELLO).is_ok()
-                    });
-                    if open {
-                        rotation.push_back((stream, buffer));
-                    }
-                }
-            });
-        }
+        let held = Arc::new(std::sync::Mutex::new(None::<TcpStream>));
         let accept = {
-            let listener = listener.clone();
+            let (listener, requests) = (listener.clone(), requests.clone());
             std::thread::spawn(move || {
-                while let Ok((stream, _)) = listener.accept() {
-                    let _ = queue.send(stream);
+                for connection in 0.. {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let (requests, held) = (requests.clone(), held.clone());
+                    std::thread::spawn(move || {
+                        let mut buffer = Vec::new();
+                        while let Some(rest) = read_head(&mut stream, &buffer) {
+                            buffer = rest;
+                            requests.fetch_add(1, Ordering::Relaxed);
+                            if connection == 0 {
+                                if stream.write_all(HELLO).is_err() {
+                                    return;
+                                }
+                                continue;
+                            }
+                            // The arrival answers the request held before it, and is held in its place; a held connection the client closed takes the answer as a failed write, harmlessly.
+                            let Ok(arrived) = stream.try_clone() else {
+                                return;
+                            };
+                            let mut held = held.lock().unwrap();
+                            if let Some(mut previous) = held.replace(arrived) {
+                                let _ = previous.write_all(HELLO);
+                            }
+                        }
+                    });
                 }
             })
         };
