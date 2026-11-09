@@ -111,7 +111,7 @@ pub struct Starvation {
     pub unanswered: usize,
     /// The connections with a starved span longer than the limit.
     pub long_span: usize,
-    /// The starved connections that the server answered in the window and whose starved spans were longer than the limit only with the drain: in the window, none was. The window measured them fairly, so `--fail-on starved` ignores them.
+    /// The starved connections that the server answered in the window and whose starved spans were longer than the limit only with the drain: in the window, each was within the limit, so `--fail-on starved` ignores them, though a span may have been close to the limit at the window's end.
     pub drain_only: usize,
     /// The longest starved span of any connection.
     pub span_max: u64,
@@ -426,8 +426,16 @@ impl Report {
         }
         if starvation.drain_only > 0 {
             criteria.push(format!(
-                "{} of them only in the drain, after the window: in the window, the server answered them and left none without a response for that long, so the window measured them fairly",
+                "{} of them only in the drain, after the window: in the window, the server answered them, and their starved spans were within the limit",
                 starvation.drain_only
+            ));
+        }
+        // A fair server leaves each connection without a response for about a round trip, so a limit shorter than the typical one flags every connection.
+        let median = self.total.distributions.round_trip.value_at_quantile(0.5);
+        if let Some(median) = median.filter(|&median| self.span_limit() < median) {
+            criteria.push(format!(
+                "the limit is shorter than the median round trip, {}, so even a fair server would exceed it: lengthen the window or raise `--starved-limit`",
+                micros(median)
             ));
         }
         // A worker that falls behind sends late, from the schedule in the open loop, and reads late, so its own delays count in the spans and waits.
@@ -477,7 +485,7 @@ impl Report {
                     .map(|reason| format!("the client was saturated: {reason}")),
             );
         }
-        // Starvation only in the drain left the window's measurement fair, so it is reported but does not fail the run.
+        // Starvation only in the drain stayed within the limit in the window, so it is reported but does not fail the run.
         if fail_on.starved && self.starvation().in_window() > 0 {
             failures.extend(self.starved());
         }

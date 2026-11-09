@@ -485,7 +485,7 @@ fn closed_loop_records_and_details() {
     );
     assert!(summary.contains("problems: 1 reset"));
     assert!(
-        summary.contains("\nSTARVED: 4 of 4 connections (100.00%) were starved: the server answered none of the requests of 3 of them in the window; the server left 1 of them without a response, with a request outstanding or due, for longer than 2.500 ms (25% of the 10.000 ms window); the longest the server left a connection without a response was 5.000 ms, and the longest wait for a response was 12.000 ms\n"),
+        summary.contains("\nSTARVED: 4 of 4 connections (100.00%) were starved: the server answered none of the requests of 3 of them in the window; the server left 1 of them without a response, with a request outstanding or due, for longer than 2.500 ms (25% of the 10.000 ms window); the limit is shorter than the median round trip, 12.000 ms, so even a fair server would exceed it: lengthen the window or raise `--starved-limit`; the longest the server left a connection without a response was 5.000 ms, and the longest wait for a response was 12.000 ms\n"),
         "{summary}"
     );
 }
@@ -920,7 +920,7 @@ fn starved_connections_are_the_servers_doing() {
             .summary()
             .contains("\nstarved: none of 4 connections; the longest the server left a connection without a response was 2.500 ms, and the longest wait for a response was at least 5.000 ms, and its request was never answered\n")
     );
-    // A span longer than the limit only with the drain is reported, but the window measured the connection fairly, so it does not fail the run.
+    // A span longer than the limit only with the drain is reported, but in the window it was within the limit, if only just, so it does not fail the run.
     let counters = &mut report.workers[0].connections[0];
     (counters.span_max, counters.span_window_max) = (4 * MS, limit);
     let starvation = report.starvation();
@@ -932,7 +932,7 @@ fn starved_connections_are_the_servers_doing() {
         ),
         (1, 1, 0)
     );
-    let reason = "1 of 4 connections (25.00%) was starved: the server left 1 of them without a response, with a request outstanding or due, for longer than 2.500 ms (25% of the 10.000 ms window); 1 of them only in the drain, after the window: in the window, the server answered them and left none without a response for that long, so the window measured them fairly; the longest the server left a connection without a response was 4.000 ms, and the longest wait for a response was at least 5.000 ms, and its request was never answered";
+    let reason = "1 of 4 connections (25.00%) was starved: the server left 1 of them without a response, with a request outstanding or due, for longer than 2.500 ms (25% of the 10.000 ms window); 1 of them only in the drain, after the window: in the window, the server answered them, and their starved spans were within the limit; the longest the server left a connection without a response was 4.000 ms, and the longest wait for a response was at least 5.000 ms, and its request was never answered";
     assert_eq!(report.starved().as_deref(), Some(reason));
     assert!(report.failures(starved).is_empty());
     assert!(
@@ -999,6 +999,16 @@ fn starved_connections_are_the_servers_doing() {
     assert_eq!(flags(2), (&json!(true), &json!(false)));
     assert_eq!(flags(3), (&json!(false), &json!(false)));
     assert_eq!(report.failures(starved), [report.starved().unwrap()]);
+    // A limit shorter than the median round trip, 999.9 µs, would flag a fair server, and the reason says so; one as long as it does not.
+    report.starved_limit = 0.05;
+    let reason = report.starved().unwrap();
+    assert!(reason.contains(
+        "; the limit is shorter than the median round trip, 999.90 µs, so even a fair server would exceed it: lengthen the window or raise `--starved-limit`; "
+    ), "{reason}");
+    report.starved_limit = 0.099_99;
+    assert_eq!(report.span_limit(), 999_900);
+    assert!(!report.starved().unwrap().contains("median round trip"));
+    report.starved_limit = 0.25;
     // A saturated client sends and reads late, so its own delays may have lengthened the spans and waits, and the reason says so.
     report.busy_limit = 0.05;
     assert!(!report.saturation().is_empty());
