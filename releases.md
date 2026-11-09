@@ -1,6 +1,6 @@
 # Releases
 
-## Unreleased
+## v0.1.0
 
 - Establish the repository and shared Base development tooling.
 - Add the HTTP/1.1 load generator, generalized from the hello benchmark's fixed-rate client: a closed loop for maximum throughput, reported as service time, and an open loop on an absolute schedule with latency from each request's planned send time, both with optional pipelining. Workers are pinned, busy-polling epoll threads that share nothing while running.
