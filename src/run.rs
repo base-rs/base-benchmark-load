@@ -345,6 +345,7 @@ pub fn run(options: &Options) -> io::Result<Report> {
         busy_limit: options.busy_limit,
         schedule_lag_limit: nanoseconds(options.schedule_lag_limit),
         shortfall_limit: options.shortfall_limit,
+        starved_limit: options.starved_limit,
         connection_details: options.connection_details,
         preflight_requests: PREFLIGHT_REQUESTS,
         context: json!({

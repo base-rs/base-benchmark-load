@@ -93,6 +93,130 @@ impl Server {
     pub fn hello() -> Self {
         Self::start(|_| Action::Respond(HELLO.to_vec()))
     }
+
+    /// A server with a fixed pool of `threads` serving threads, as Puma has, that answers every request with [`HELLO`]. It accepts every connection, but a thread serves one connection until it closes, so a connection accepted while every thread serves another waits, unread, until one closes; with keep-alive, none does. The preflight connection, accepted first, closes after its response, so exactly `threads` of the load's connections are served and every other is starved, whatever order they connect in, until the client closes connections.
+    pub fn pool(threads: usize) -> Self {
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (queue, accepted) = std::sync::mpsc::channel::<(TcpStream, usize)>();
+        let accepted = Arc::new(std::sync::Mutex::new(accepted));
+        for _ in 0..threads {
+            let (accepted, requests) = (accepted.clone(), requests.clone());
+            std::thread::spawn(move || {
+                loop {
+                    // The lock is held only to take the next connection; the queue closes when the accept loop ends.
+                    let next = accepted.lock().unwrap().recv();
+                    let Ok((stream, connection)) = next else {
+                        return;
+                    };
+                    serve(
+                        stream,
+                        connection,
+                        &|_| Action::Respond(HELLO.to_vec()),
+                        &requests,
+                    );
+                }
+            });
+        }
+        let accept = {
+            let listener = listener.clone();
+            std::thread::spawn(move || {
+                for connection in 0.. {
+                    let Ok((stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let _ = queue.send((stream, connection));
+                }
+            })
+        };
+        Self {
+            address,
+            listener,
+            requests,
+            accept: Some(accept),
+        }
+    }
+}
+
+impl Server {
+    /// A server that answers every request with [`HELLO`], except that it stops answering the load's even connections, in accept order, after their `answered`th response, and never answers a connection accepted after the load's `connections`, which can only be a reconnection, since a connection the server answers fails only if the client stalls for its whole `--timeout`. The point is an event, not a time: the connections it stops answering are served, then starved, however fast the host runs, as the review of starvation found missed.
+    pub fn starving_after(connections: usize, answered: usize) -> Self {
+        Self::start(move |arrival| {
+            let reconnection = arrival.connection > connections;
+            let stopped = arrival.connection != 0
+                && arrival.connection % 2 == 0
+                && arrival.request >= answered;
+            if reconnection || stopped {
+                Action::Ignore
+            } else {
+                Action::Respond(HELLO.to_vec())
+            }
+        })
+    }
+
+    /// A server that answers each request of the load with [`HELLO`] only when the next request arrives, on any connection, so that it holds only the request that arrived last. While a closed loop's connections send, each request is answered by the next arrival, which a round trip of another connection brings; once the window ends, the client sends nothing more, so exactly one request, the one that arrived last, is never answered, and is starved only in the drain. The preflight connection, accepted first, is answered at once, since the load waits for it.
+    pub fn relaying() -> Self {
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let held = Arc::new(std::sync::Mutex::new(None::<TcpStream>));
+        let accept = {
+            let (listener, requests) = (listener.clone(), requests.clone());
+            std::thread::spawn(move || {
+                for connection in 0.. {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let (requests, held) = (requests.clone(), held.clone());
+                    std::thread::spawn(move || {
+                        let mut buffer = Vec::new();
+                        while let Some(rest) = read_head(&mut stream, &buffer) {
+                            buffer = rest;
+                            requests.fetch_add(1, Ordering::Relaxed);
+                            if connection == 0 {
+                                if stream.write_all(HELLO).is_err() {
+                                    return;
+                                }
+                                continue;
+                            }
+                            // The arrival answers the request held before it, and is held in its place; a held connection the client closed takes the answer as a failed write, harmlessly.
+                            let Ok(arrived) = stream.try_clone() else {
+                                return;
+                            };
+                            let mut held = held.lock().unwrap();
+                            if let Some(mut previous) = held.replace(arrived) {
+                                let _ = previous.write_all(HELLO);
+                            }
+                        }
+                    });
+                }
+            })
+        };
+        Self {
+            address,
+            listener,
+            requests,
+            accept: Some(accept),
+        }
+    }
+}
+
+/// Read until `buffer` and what follows hold a request head, of a request without a body, and return what follows it, or `None` when the connection ends first.
+fn read_head(stream: &mut TcpStream, buffer: &[u8]) -> Option<Vec<u8>> {
+    let mut buffer = buffer.to_vec();
+    let mut chunk = [0; 16 * 1024];
+    loop {
+        if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            return Some(buffer.split_off(end + 4));
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return None,
+            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Stop listening, which also wakes a blocked `accept` with an error. Shut the socket down rather than only closing it: a process spawned concurrently by another test may briefly hold a duplicate of the descriptor, which would keep it listening. The socket stays bound to its port.

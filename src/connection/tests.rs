@@ -553,6 +553,19 @@ fn abandoning_counts_unsent_requests_by_period() {
     assert_eq!(statistics.finished(), 6);
     assert_eq!(connection.state, State::Down { until: u64::MAX });
     assert!(!connection.has_work(0, &settings));
+    // Ordinal 0, planned at the start, waited a second unanswered; ordinal 2, the oldest never sent, waited 2 ms less.
+    assert_eq!(
+        (
+            connection.counters.wait_max,
+            connection.counters.wait_unanswered
+        ),
+        (1000 * MS, true)
+    );
+    // Abandoned again, with every request accounted for, nothing more waited.
+    connection.counters.wait_max = 0;
+    connection.abandon(START + 2000 * MS, &settings, &mut statistics);
+    assert_eq!(connection.counters.wait_max, 0);
+    assert_eq!(statistics.finished(), 6);
     // A connection that never connected still accounts for its warmup.
     let mut connection = Connection::<Script>::new(1);
     let mut statistics = WorkerStatistics::new(&settings.timing);
@@ -566,6 +579,18 @@ fn abandoning_counts_unsent_requests_by_period() {
         5
     );
     assert_eq!(statistics.disconnects, 0);
+    // Abandoned before the window, its requests were never outstanding in it, so none waited in it.
+    assert_eq!(connection.counters.wait_max, 0);
+    // Abandoned at the window's end, the oldest never sent, ordinal 1, waited from its planned time.
+    let mut connection = Connection::<Script>::new(1);
+    connection.abandon(START + 12 * MS, &settings, &mut statistics);
+    assert_eq!(
+        (
+            connection.counters.wait_max,
+            connection.counters.wait_unanswered
+        ),
+        (11 * MS, true)
+    );
 }
 
 #[test]
@@ -648,4 +673,197 @@ fn connection_failures_allow_a_retry_after_the_delay() {
     );
     assert!(connection.stream.is_none());
     assert_eq!(statistics.connect_errors, 1);
+}
+
+/// Deliver one valid response at `now`.
+fn respond(
+    connection: &mut Connection<Script>,
+    now: u64,
+    settings: &Settings,
+    statistics: &mut WorkerStatistics,
+) {
+    connection
+        .stream
+        .as_mut()
+        .unwrap()
+        .reads
+        .push_back(Ok(RESPONSE.to_vec()));
+    connection
+        .readable(&StepClock::new(now, 0), false, settings, statistics)
+        .unwrap();
+}
+
+/// The longest starved span, and its part in the window.
+fn spans(connection: &Connection<Script>) -> (u64, u64) {
+    (
+        connection.counters.span_max,
+        connection.counters.span_window_max,
+    )
+}
+
+/// In the open loop, a slot's starved span begins at the planned time of the request it waits for, ends at each response, and continues from it while a request is due, across failures and reconnections, until the drain deadline abandons what is left.
+#[test]
+fn an_open_loop_starved_span_runs_across_failures_and_reconnections() {
+    let fixture = Fixture::new();
+    let settings = fixture.rate(1, 1);
+    let (mut connection, mut statistics) = open_measured(&settings, script([]));
+    // Ordinal 2, planned at 2 ms, is sent 300 ns late; the span begins at its planned time.
+    connection.dispatch(START + 2 * MS + 300, 3, &settings, &mut statistics);
+    assert_eq!(connection.counters.span_since, Some(START + 2 * MS));
+    // Its response at 7.5 ms ends the span, and ordinals 3 to 7 are due, so another begins.
+    respond(
+        &mut connection,
+        START + 7 * MS + MS / 2,
+        &settings,
+        &mut statistics,
+    );
+    assert_eq!(spans(&connection), (5 * MS + MS / 2, 5 * MS + MS / 2));
+    assert_eq!(
+        connection.counters.span_since,
+        Some(START + 7 * MS + MS / 2)
+    );
+    connection.dispatch(START + 8 * MS, 8, &settings, &mut statistics);
+    // A reset fails ordinal 3, but ordinal 4 is due, so the span stays open while the slot reconnects.
+    connection.fail(ErrorKind::Reset, START + 9 * MS, &settings, &mut statistics);
+    assert_eq!(
+        connection.counters.span_since,
+        Some(START + 7 * MS + MS / 2)
+    );
+    let (mut reconnected, _) = open(&settings, script([]), START + 10 * MS);
+    connection.stream = reconnected.stream.take();
+    connection.connected(START + 10 * MS, &mut statistics);
+    connection.dispatch(START + 10 * MS, 12, &settings, &mut statistics);
+    // Its request times out after the window, with later ones due: still open.
+    connection.fail(
+        ErrorKind::Timeout,
+        START + 15 * MS,
+        &settings,
+        &mut statistics,
+    );
+    assert_eq!(
+        connection.counters.span_since,
+        Some(START + 7 * MS + MS / 2)
+    );
+    // The drain deadline ends it, 12.5 ms long, 4.5 ms of it in the window.
+    connection.abandon(START + 20 * MS, &settings, &mut statistics);
+    assert_eq!(connection.counters.span_since, None);
+    assert_eq!(spans(&connection), (12 * MS + MS / 2, 5 * MS + MS / 2));
+    assert_eq!(connection.counters.valid, 1);
+}
+
+/// In the open loop, a slot with nothing outstanding or due has no starved span: a response or a failure with nothing due ends it, and the next request's planned time begins another. A span counts only from the window's start.
+#[test]
+fn an_open_loop_slot_with_nothing_due_is_not_starved() {
+    let fixture = Fixture::new();
+    // Four connections: this one has ordinals 0, 4, and 8.
+    let settings = fixture.rate(4, 1);
+    let (mut connection, mut statistics) = open(&settings, script([]), START);
+    connection.dispatch(START, 1, &settings, &mut statistics);
+    // Answered in the warmup, with nothing due: the span ends, before the window, so it counts for nothing.
+    respond(&mut connection, START + MS, &settings, &mut statistics);
+    assert_eq!(connection.counters.span_since, None);
+    assert_eq!(spans(&connection), (0, 0));
+    // Ordinal 4 is planned at 4 ms, sent late, and answered at 5 ms, with ordinal 8 not due until 8 ms.
+    connection.dispatch(START + 4 * MS + 500, 5, &settings, &mut statistics);
+    assert_eq!(connection.counters.span_since, Some(START + 4 * MS));
+    respond(&mut connection, START + 5 * MS, &settings, &mut statistics);
+    assert_eq!(spans(&connection), (MS, MS));
+    assert_eq!(connection.counters.span_since, None);
+    // Ordinal 8 fails, the slot's last: nothing is due, so its span ends with the failure.
+    connection.dispatch(START + 8 * MS, 9, &settings, &mut statistics);
+    connection.fail(
+        ErrorKind::Reset,
+        START + 10 * MS,
+        &settings,
+        &mut statistics,
+    );
+    assert_eq!(connection.counters.span_since, None);
+    assert_eq!(spans(&connection), (2 * MS, 2 * MS));
+    // A slot that never sent a request planned in the window waits from its planned time until the drain deadline.
+    let mut connection = Connection::<Script>::new(1);
+    connection.next_ordinal = 5;
+    connection.abandon(START + 30 * MS, &settings, &mut statistics);
+    assert_eq!(spans(&connection), (25 * MS, 7 * MS));
+}
+
+/// Any response ends a starved span, valid or not: an invalid but well-framed response is the server answering the slot, and is reported as invalid, not as starvation.
+#[test]
+fn an_invalid_response_ends_a_starved_span() {
+    let fixture = Fixture::new();
+    let settings = fixture.closed(1);
+    let (mut connection, mut statistics) = open(&settings, script([]), START);
+    connection.dispatch(START + 3 * MS, 0, &settings, &mut statistics);
+    assert_eq!(connection.counters.span_since, Some(START + 3 * MS));
+    // A response with the wrong body, at 5 ms, ends the span 2 ms long, and the next request's begins with it.
+    connection.stream.as_mut().unwrap().reads.push_back(Ok(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nno".to_vec(),
+    ));
+    connection
+        .readable(
+            &StepClock::new(START + 5 * MS, 0),
+            false,
+            &settings,
+            &mut statistics,
+        )
+        .unwrap();
+    assert_eq!(
+        (connection.counters.valid, connection.counters.invalid),
+        (0, 1)
+    );
+    assert_eq!(spans(&connection), (2 * MS, 2 * MS));
+    assert_eq!(connection.counters.span_since, Some(START + 5 * MS));
+}
+
+/// In the closed loop, a slot always has a request to send in the window, so its starved span runs from its last response across failures, until the window's end if it has nothing in flight then, or until its requests in flight have outcomes in the drain.
+#[test]
+fn a_closed_loop_starved_span_ends_with_the_slots_last_outcome() {
+    let fixture = Fixture::new();
+    let settings = fixture.closed(1);
+    let (mut connection, mut statistics) = open(&settings, script([]), START);
+    // Sent in the warmup and answered in the window: only the part from the window's start counts.
+    connection.dispatch(START + MS, 0, &settings, &mut statistics);
+    respond(&mut connection, START + 3 * MS, &settings, &mut statistics);
+    assert_eq!(spans(&connection), (MS, MS));
+    assert_eq!(connection.counters.span_since, Some(START + 3 * MS));
+    connection.dispatch(START + 3 * MS, 0, &settings, &mut statistics);
+    // A reset in the window leaves the slot with a request to send, so the span stays open, and with nothing in flight, it ends at the window's end.
+    connection.fail(ErrorKind::Reset, START + 4 * MS, &settings, &mut statistics);
+    assert_eq!(connection.counters.span_since, Some(START + 3 * MS));
+    connection.finish(START + 20 * MS, &settings);
+    assert_eq!(spans(&connection), (9 * MS, 9 * MS));
+    // Connecting at the drain deadline, with nothing in flight, the slot stopped waiting at the window's end.
+    let (mut connection, mut statistics) = open(&settings, script([]), START);
+    connection.dispatch(START + 5 * MS, 0, &settings, &mut statistics);
+    connection.fail(ErrorKind::Reset, START + 6 * MS, &settings, &mut statistics);
+    let (mut reconnecting, _) = open(&settings, script([]), START + 7 * MS);
+    connection.connecting(reconnecting.stream.take().unwrap(), START + 7 * MS);
+    connection.abandon(START + 30 * MS, &settings, &mut statistics);
+    assert_eq!(spans(&connection), (7 * MS, 7 * MS));
+    // A request in flight at the window's end keeps the span open into the drain, until its outcome.
+    let (mut connection, mut statistics) = open(&settings, script([]), START);
+    connection.dispatch(START + 11 * MS, 0, &settings, &mut statistics);
+    respond(&mut connection, START + 15 * MS, &settings, &mut statistics);
+    assert_eq!(spans(&connection), (4 * MS, MS));
+    assert_eq!(connection.counters.span_since, None);
+    let (mut connection, mut statistics) = open(&settings, script([]), START);
+    connection.dispatch(START + 11 * MS, 0, &settings, &mut statistics);
+    connection.fail(
+        ErrorKind::Timeout,
+        START + 25 * MS,
+        &settings,
+        &mut statistics,
+    );
+    assert_eq!(spans(&connection), (14 * MS, MS));
+    // Pipelined: a response with another request still in flight ends one span and begins the next.
+    let settings = fixture.closed(2);
+    let (mut connection, mut statistics) = open(&settings, script([]), START);
+    assert_eq!(
+        connection.dispatch(START + 11 * MS, 0, &settings, &mut statistics),
+        2
+    );
+    respond(&mut connection, START + 13 * MS, &settings, &mut statistics);
+    assert_eq!(connection.counters.span_since, Some(START + 13 * MS));
+    respond(&mut connection, START + 16 * MS, &settings, &mut statistics);
+    assert_eq!(spans(&connection), (3 * MS, MS));
+    assert_eq!(connection.counters.span_since, None);
 }

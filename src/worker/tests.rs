@@ -186,6 +186,40 @@ fn an_open_loop_worker_runs_its_schedule_on_its_clock() {
     assert!(statistics.busy > 0);
 }
 
+/// Each connection counts its requests planned in the window, not those of the warmup: with a 3 ms warmup, two connections share the ordinals 3 to 12 of the window, five each, and the warmup's 0 to 2 are not theirs to answer in it.
+#[test]
+fn a_connections_planned_requests_leave_out_the_warmup() {
+    let fixture = Fixture::new();
+    let listener = listener();
+    let mut load = fixture.load(listener.local_addr().unwrap(), 2);
+    load.warmup = 3 * MS;
+    load.timeout = 2 * MS;
+    load.drain_timeout = 100_000 * MS;
+    let clock = StepClock::new(0, 10_000);
+    let start = Start::new(1);
+    let result = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| work(&load, 0, Epoll::new(), &clock, &start));
+        assert!(start.wait_for_workers().is_none());
+        start.publish(clock.now() + MS);
+        worker.join().unwrap().unwrap()
+    });
+    let planned: Vec<u64> = result
+        .connections
+        .iter()
+        .map(|counters| counters.planned)
+        .collect();
+    assert_eq!(planned, [5, 5]);
+    let statistics = &result.statistics;
+    assert_eq!(
+        statistics.period(Period::Warmup).errors[ErrorKind::Timeout as usize],
+        3
+    );
+    assert_eq!(
+        statistics.period(Period::Measured).errors[ErrorKind::Timeout as usize],
+        10
+    );
+}
+
 /// A poller whose every wait takes `pause` of its clock's time, as a long iteration handling many events would.
 struct Pausing<'a> {
     epoll: Epoll,
@@ -736,6 +770,37 @@ fn maintenance_times_out_connections_and_retries_failed_ones() {
         &settings,
         &mut statistics
     ));
+}
+
+#[test]
+fn a_finished_worker_ends_its_slots_starved_spans() {
+    let fixture = Fixture::new();
+    let mut load = fixture.load("127.0.0.1:1".parse().unwrap(), 1);
+    load.schedule = None;
+    let settings = load.settings(MS);
+    let mut statistics = WorkerStatistics::new(&settings.timing);
+    let mut connections = connections(1);
+    let mut poller = Epoll::new().unwrap();
+    // A closed-loop slot that failed in the window and was still reconnecting at its end, with nothing in flight, waited until the window's end.
+    let since = settings.timing.window_start + 2 * MS;
+    connections[0].counters.span_since = Some(since);
+    assert!(done(
+        &mut connections,
+        &mut poller,
+        settings.timing.window_end + 5 * MS,
+        0,
+        &settings,
+        &mut statistics
+    ));
+    let counters = &connections[0].counters;
+    assert_eq!(
+        (
+            counters.span_since,
+            counters.span_max,
+            counters.span_window_max
+        ),
+        (None, 8 * MS, 8 * MS)
+    );
 }
 
 #[test]

@@ -159,6 +159,15 @@ impl Timing {
         }
     }
 
+    /// When `request` began waiting for its response: its send in the closed loop, and its planned time in the open loop, from which latency is measured.
+    pub(crate) fn waiting_since(&self, request: &Request) -> u64 {
+        if self.closed {
+            request.sent
+        } else {
+            request.planned
+        }
+    }
+
     fn in_window(&self, instant: u64) -> bool {
         (self.window_start..self.window_end).contains(&instant)
     }
@@ -187,7 +196,7 @@ pub struct Request {
     pub eligible: u64,
 }
 
-/// One connection's counters, for fairness across connections. Completions and latencies cover the measured period only.
+/// One connection's counters, for fairness across connections and starvation. Completions and latencies cover the measured period only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConnectionCounters {
     pub valid: u64,
@@ -196,6 +205,59 @@ pub struct ConnectionCounters {
     pub latency_sum: u128,
     pub latency_max: u64,
     pub bytes_read: u64,
+    /// The connection's requests planned in the window, in the open loop; zero in the closed loop.
+    pub planned: u64,
+    /// The longest any of the connection's requests outstanding in the window waited for its response: from its send in the closed loop, or its planned time in the open loop, to its response, its failure, or, for a planned request never sent, the drain deadline. A request with an outcome before the window was not outstanding in it.
+    pub wait_max: u64,
+    /// Whether the request that waited longest ended without a response, as a failure or never sent, so that its wait is only a lower bound of the time the server would have kept it waiting.
+    pub wait_unanswered: bool,
+    /// The longest starved span of the connection's slot, across its failures and reconnections: a time during which it had a request outstanding or due to send, and the server sent it no response. Only the part from the window's start counts, but a span open at the window's end runs on through the drain, until a response or until the slot has nothing outstanding or due.
+    pub span_max: u64,
+    /// The longest part of a starved span that lay in the window, which is [`ConnectionCounters::span_max`] without the drain.
+    pub span_window_max: u64,
+    /// When the open starved span began, if one is open: when the slot last had a response, or, if it had nothing outstanding or due then, when its next request became due, at its send in the closed loop or its planned time in the open loop.
+    pub(crate) span_since: Option<u64>,
+}
+
+impl ConnectionCounters {
+    /// Record that the slot has a request outstanding or due since `since`, which opens a starved span unless one is open.
+    pub(crate) fn pending(&mut self, since: u64) {
+        self.span_since.get_or_insert(since);
+    }
+
+    /// Record a response at `now`, which ends the open starved span, and opens another at `now` if the slot still has a request outstanding or due.
+    pub(crate) fn answered(&mut self, timing: &Timing, now: u64, pending: bool) {
+        self.idle(timing, now);
+        if pending {
+            self.span_since = Some(now);
+        }
+    }
+
+    /// Record that at `now` the slot has nothing outstanding or due, which ends the open starved span without a response.
+    pub(crate) fn idle(&mut self, timing: &Timing, now: u64) {
+        let Some(since) = self.span_since.take() else {
+            return;
+        };
+        let from = since.max(timing.window_start);
+        self.span_max = self.span_max.max(now.saturating_sub(from));
+        self.span_window_max = self
+            .span_window_max
+            .max(now.min(timing.window_end).saturating_sub(from));
+    }
+
+    /// Record that a request of the connection, sent or planned at `since`, ended at `now`, with a response if `answered`, unless it ended before the window and so was not outstanding in it.
+    pub(crate) fn waited(&mut self, timing: &Timing, since: u64, now: u64, answered: bool) {
+        if now < timing.window_start {
+            return;
+        }
+        let wait = now.saturating_sub(since);
+        if wait > self.wait_max {
+            self.wait_max = wait;
+            self.wait_unanswered = !answered;
+        } else if wait == self.wait_max {
+            self.wait_unanswered |= !answered;
+        }
+    }
 }
 
 /// One reporting interval of the window: completions in it, and the latency of the measured requests assigned to it, by planned time in the open loop and by completion in the closed loop.
@@ -345,6 +407,7 @@ impl WorkerStatistics {
         connection: &mut ConnectionCounters,
     ) {
         self.last_outcome = self.last_outcome.max(Some(now));
+        connection.waited(timing, timing.waiting_since(request), now, true);
         if timing.in_window(now) {
             self.completed_in_window += 1;
             self.intervals[timing.interval_index(now)].completions += 1;
@@ -394,6 +457,7 @@ impl WorkerStatistics {
         connection: &mut ConnectionCounters,
     ) {
         self.last_outcome = self.last_outcome.max(Some(now));
+        connection.waited(timing, timing.waiting_since(request), now, false);
         let period = timing.period(request, now);
         self.periods[period as usize].errors[kind as usize] += 1;
         if period == Period::Measured {

@@ -139,6 +139,38 @@ fn fail_on_classes_suppress_the_record() {
     );
 }
 
+/// A server with one thread serves one of the two connections and starves the other, so `--fail-on starved` exits unsuccessfully without a record. Whether or not the served connection is answered in the short window, at least one is starved.
+#[test]
+fn fail_on_starved_suppresses_the_record() {
+    let server = Server::pool(1);
+    let address = server.address.to_string();
+    let output = command(&[
+        "closed",
+        "--address",
+        &address,
+        "--connections",
+        "2",
+        "--warmup",
+        "0",
+        "--duration",
+        "20ms",
+        "--drain-timeout",
+        "10ms",
+        "--fail-on",
+        "starved",
+    ]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("\nSTARVED: "), "{stderr}");
+    let error = stderr.lines().last().unwrap();
+    assert!(
+        error.starts_with("base-benchmark-load: ") && error.contains(" of 2 connections ("),
+        "{stderr}"
+    );
+    assert!(error.contains(" starved: "), "{stderr}");
+}
+
 /// The server never answers, so there is no valid response whether or not a request was sent in the short window.
 #[test]
 fn closed_loops_without_a_valid_response_fail() {

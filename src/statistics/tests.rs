@@ -114,6 +114,11 @@ fn open_loop_outcomes_belong_to_their_planned_period() {
         (connection.valid, connection.invalid, connection.errors),
         (1, 1, 1)
     );
+    // The longest wait of a request outstanding in the window, from its planned time: the timeout, planned at 112 ms and failed at 200 ms, without a response.
+    assert_eq!(
+        (connection.wait_max, connection.wait_unanswered),
+        (88 * MS, true)
+    );
 }
 
 #[test]
@@ -148,6 +153,42 @@ fn closed_loop_outcomes_belong_to_the_period_they_happen_in() {
     assert_eq!(statistics.distributions.latency.count(), 0);
     assert_eq!(statistics.intervals[0].latency.max(), Some(MS));
     assert_eq!(connection.errors, 0);
+    // In the closed loop a request waits from its send: the one sent at 119 ms waited 6 ms until it failed. The request answered at 109 ms, before the window, was not outstanding in it.
+    assert_eq!(
+        (connection.wait_max, connection.wait_unanswered),
+        (6 * MS, true)
+    );
+}
+
+/// The longest wait is a lower bound when any request that waited that long ended without a response.
+#[test]
+fn the_longest_wait_says_whether_it_was_answered() {
+    let timing = timing(true);
+    let mut connection = ConnectionCounters::default();
+    connection.waited(&timing, 110 * MS, 115 * MS, true);
+    assert_eq!(
+        (connection.wait_max, connection.wait_unanswered),
+        (5 * MS, false)
+    );
+    // As long, but unanswered.
+    connection.waited(&timing, 111 * MS, 116 * MS, false);
+    assert!(connection.wait_unanswered);
+    // As long and answered again, or shorter: it stays a lower bound.
+    connection.waited(&timing, 112 * MS, 117 * MS, true);
+    connection.waited(&timing, 112 * MS, 113 * MS, true);
+    assert_eq!(
+        (connection.wait_max, connection.wait_unanswered),
+        (5 * MS, true)
+    );
+    // Longer and answered.
+    connection.waited(&timing, 110 * MS, 119 * MS, true);
+    assert_eq!(
+        (connection.wait_max, connection.wait_unanswered),
+        (9 * MS, false)
+    );
+    // Ended before the window, however long it waited.
+    connection.waited(&timing, 0, 109 * MS, false);
+    assert_eq!(connection.wait_max, 9 * MS);
 }
 
 #[test]
