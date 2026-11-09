@@ -786,6 +786,34 @@ fn an_open_loop_slot_with_nothing_due_is_not_starved() {
     assert_eq!(spans(&connection), (25 * MS, 7 * MS));
 }
 
+/// Any response ends a starved span, valid or not: an invalid but well-framed response is the server answering the slot, and is reported as invalid, not as starvation.
+#[test]
+fn an_invalid_response_ends_a_starved_span() {
+    let fixture = Fixture::new();
+    let settings = fixture.closed(1);
+    let (mut connection, mut statistics) = open(&settings, script([]), START);
+    connection.dispatch(START + 3 * MS, 0, &settings, &mut statistics);
+    assert_eq!(connection.counters.span_since, Some(START + 3 * MS));
+    // A response with the wrong body, at 5 ms, ends the span 2 ms long, and the next request's begins with it.
+    connection.stream.as_mut().unwrap().reads.push_back(Ok(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nno".to_vec(),
+    ));
+    connection
+        .readable(
+            &StepClock::new(START + 5 * MS, 0),
+            false,
+            &settings,
+            &mut statistics,
+        )
+        .unwrap();
+    assert_eq!(
+        (connection.counters.valid, connection.counters.invalid),
+        (0, 1)
+    );
+    assert_eq!(spans(&connection), (2 * MS, 2 * MS));
+    assert_eq!(connection.counters.span_since, Some(START + 5 * MS));
+}
+
 /// In the closed loop, a slot always has a request to send in the window, so its starved span runs from its last response across failures, until the window's end if it has nothing in flight then, or until its requests in flight have outcomes in the drain.
 #[test]
 fn a_closed_loop_starved_span_ends_with_the_slots_last_outcome() {
